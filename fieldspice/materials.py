@@ -486,7 +486,11 @@ _CM6 = 1e-12            # cm^6/s -> m^6/s
 
 _SI_SEMI = SemiconductorParams(
     Eg=1.124,                       # Varshni fit at 300 K; 1.12 is the rounded value
-    ni_300=1.0e10 * _CM3,           # measured; Sproul & Green 1991 give 9.65e9 cm^-3
+    # Measured, Sproul & Green, J. Appl. Phys. 70, 846 (1991). This MUST stay
+    # equal to fieldspice.reference.NI_SI_300: two definitions of ni in one
+    # package means every built-in potential silently depends on which module
+    # you asked, and tests/test_infra.py enforces that they agree.
+    ni_300=9.65e9 * _CM3,
     chi=4.05,
     mu_n=1350.0 * _MOB,
     mu_p=480.0 * _MOB,

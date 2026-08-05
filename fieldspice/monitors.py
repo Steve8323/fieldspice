@@ -292,6 +292,7 @@ class _GridCache:
         self._node_vol: np.ndarray | None = None
 
     def grid(self, state: Mapping[str, Any], who: str) -> RectilinearGrid:
+        """The state's grid, invalidating the cache if it changed."""
         g = _require(state, "grid", who, "monitors need the grid metric")
         if g is not self._grid:
             self._grid = g
@@ -467,10 +468,12 @@ class Monitor(ABC):
 
     @property
     def n_seen(self) -> int:
+        """How many times :meth:`record` was called."""
         return self._n_seen
 
     @property
     def n_records(self) -> int:
+        """How many calls were kept; differs from :attr:`n_seen` only if strided."""
         return len(self._t)
 
     # -- hooks for subclasses ---------------------------------------------
@@ -596,6 +599,7 @@ class NodeProbe(Monitor):
 
 
 def _reduce(vals: np.ndarray, how: str) -> float:
+    """Collapse the sampled node values to one number."""
     if how == "mean":
         return float(np.mean(vals))
     if how == "sum":
@@ -1157,11 +1161,10 @@ class FluxMonitor(Monitor):
             raise ValueError(f"FluxMonitor {name!r}: sign must be +1 or -1")
         self.axis: int | None = None
         if by_plane:
-            if axis not in _AXIS_NAMES:
-                raise ValueError(
-                    f"FluxMonitor {name!r}: axis must be one of "
-                    f"'x', 'y', 'z', 0, 1, 2; got {axis!r}")
-            self.axis = _AXIS_NAMES[axis]
+            try:
+                self.axis = _axis_index(axis)  # type: ignore[arg-type]
+            except ValueError as exc:
+                raise ValueError(f"FluxMonitor {name!r}: {exc}") from None
             self.position = float(position)  # type: ignore[arg-type]
         if bounds is not None:
             bl = list(bounds)
@@ -1219,7 +1222,11 @@ class FluxMonitor(Monitor):
         nodes_d = (grid.xn, grid.yn, grid.zn)[d]
         ncell_d = grid.ncell[d]
         lo, hi = float(nodes_d[0]), float(nodes_d[-1])
-        if self.position < lo - 1e-12 or self.position > hi + 1e-12:
+        # Tolerances are relative to the axis span: fieldspice problems run
+        # from nanometres to metres, so any fixed absolute epsilon is wrong at
+        # one end or the other.
+        tol_d = 1e-9 * (hi - lo)
+        if self.position < lo - tol_d or self.position > hi + tol_d:
             raise ValueError(
                 f"{who}: plane at {self.position:g} m is outside the domain "
                 f"extent [{lo:g}, {hi:g}] m along axis {'xyz'[d]}")
@@ -1249,7 +1256,8 @@ class FluxMonitor(Monitor):
                 if coord.size != sel.shape[pos]:
                     raise ValueError(
                         f"{who}: internal indexing error resolving bounds")
-                ok = (coord >= blo - 1e-12) & (coord <= bhi + 1e-12)
+                tol = 1e-9 * (float(coord[-1]) - float(coord[0]))
+                ok = (coord >= blo - tol) & (coord <= bhi + tol)
                 keep &= ok.reshape((-1, 1) if pos == 0 else (1, -1))
         idx = sel[keep].ravel().astype(np.intp)
         if idx.size == 0:
@@ -1505,10 +1513,12 @@ class MonitorSet:
     # -- container protocol ------------------------------------------------
     @property
     def times(self) -> np.ndarray:
+        """Master time axis of every :meth:`record` call [s]."""
         return np.asarray(self._t, dtype=float)
 
     @property
     def names(self) -> tuple[str, ...]:
+        """Names of the registered monitors, in insertion order."""
         return tuple(self._monitors)
 
     def __len__(self) -> int:

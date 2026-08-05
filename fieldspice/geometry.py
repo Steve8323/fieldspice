@@ -687,17 +687,24 @@ class Prism(Shape):
             raise ValueError(f"vertices must have shape (n, 2), got {v.shape}")
         if not np.all(np.isfinite(v)):
             raise ValueError("vertices must be finite")
-        if v.shape[0] >= 2 and np.allclose(v[0], v[-1]):
+        # Exact equality, not np.allclose: with strict SI a 2 nm pad has
+        # vertices 2e-9 apart, well inside allclose's 1e-8 default atol, and a
+        # tolerant test would silently delete a corner.
+        if v.shape[0] >= 2 and np.array_equal(v[0], v[-1]):
             v = v[:-1]
         if v.shape[0] < 3:
             raise ValueError(f"a polygon needs at least 3 distinct vertices, got {v.shape[0]}")
-        seg = np.roll(v, -1, axis=0) - v
-        if np.any(np.all(seg == 0.0, axis=1)):
+        if np.any(np.all(np.roll(v, -1, axis=0) == v, axis=1)):
             raise ValueError("polygon has a repeated consecutive vertex")
+        diameter = float(np.max(v.max(axis=0) - v.min(axis=0)))
         area2 = float(np.sum(v[:, 0] * np.roll(v[:, 1], -1)
                              - np.roll(v[:, 0], -1) * v[:, 1]))
-        if abs(area2) == 0.0:
-            raise ValueError("polygon is degenerate (zero area)")
+        # Scale-free degeneracy test: the threshold is on the dimensionless
+        # ratio area / diameter^2, so it means the same thing at nm and at m.
+        if abs(area2) <= 1e-14 * diameter * diameter:
+            raise ValueError(
+                f"polygon is degenerate: area {0.5 * abs(area2):g} m^2 is "
+                f"negligible against its diameter {diameter:g} m")
 
         self.axis = _axis_index(axis)
         if lo is not None or hi is not None:
@@ -719,7 +726,6 @@ class Prism(Shape):
         self.lo = lo_f
         self.hi = hi_f
         self.area = 0.5 * abs(area2)
-        diameter = float(np.max(v.max(axis=0) - v.min(axis=0)))
         self._tol = 1e-12 * diameter
 
     @property
@@ -1133,7 +1139,10 @@ class LayerStack:
         self._layers.append(layer)
 
         g_lo, g_hi = self.grid.bounds[self.axis]
-        if layer.hi > g_hi + 1e-15 * max(abs(g_hi), 1.0) or layer.lo < g_lo:
+        # Relative tolerance: an absolute one is meaningless across the ~9
+        # decades of length this code has to span.
+        tol = 1e-12 * (g_hi - g_lo)
+        if layer.hi > g_hi + tol or layer.lo < g_lo - tol:
             # Silently growing past the domain wall is the classic way to lose
             # half a stack; the layer is still recorded so the geometry stays
             # self-consistent, but the user gets told.
