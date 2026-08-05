@@ -1265,7 +1265,8 @@ class LayerStack:
 
     # -- application -------------------------------------------------------
     def apply(self, matmap: "MaterialMap", subsample: int = 2,
-              binary: bool = False, threshold: float = 0.5) -> None:
+              binary: bool = False, threshold: float = 0.5,
+              **assign_kw) -> None:
         """Write every layer into a :class:`~fieldspice.materials.MaterialMap`.
 
         Layers are applied bottom first, so a later layer wins wherever two
@@ -1285,6 +1286,11 @@ class LayerStack:
             of A2.  Default ``False``.
         threshold : float, optional
             Cutoff used when ``binary`` is ``True``.  Default 0.5.
+        **assign_kw
+            Forwarded verbatim to ``MaterialMap.assign``, which is where the
+            effective-medium mixing rule lives (``mix="linear"`` is exact for
+            field components parallel to an interface, ``mix="harmonic"`` for
+            the perpendicular component).
 
         Raises
         ------
@@ -1304,10 +1310,10 @@ class LayerStack:
         for layer in self._layers:
             frac = voxelize(self.grid, layer.solid(), subsample)
             if binary:
-                assign(frac >= float(threshold), layer.material)
+                assign(frac >= float(threshold), layer.material, **assign_kw)
                 continue
             try:
-                assign(frac, layer.material)
+                assign(frac, layer.material, **assign_kw)
             except (TypeError, IndexError, ValueError) as exc:
                 # MaterialMap is written independently; if this build of it only
                 # accepts boolean masks, fall back rather than fail, but say so,
@@ -1319,4 +1325,4 @@ class LayerStack:
                     f"{threshold:g}, which forfeits sub-cell material mixing. "
                     f"Pass binary=True to silence this.",
                     stacklevel=2)
-                assign(frac >= float(threshold), layer.material)
+                assign(frac >= float(threshold), layer.material, **assign_kw)

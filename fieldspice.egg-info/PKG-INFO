@@ -1,3 +1,45 @@
+Metadata-Version: 2.4
+Name: fieldspice
+Version: 0.1.0
+Summary: First-principles electromagnetic field simulation for analog and digital circuits
+Author: Steven Hou
+License: MIT
+Project-URL: Homepage, https://github.com/Steve8323/fieldspice
+Project-URL: Documentation, https://github.com/Steve8323/fieldspice/tree/main/docs
+Project-URL: Issues, https://github.com/Steve8323/fieldspice/issues
+Keywords: electromagnetics,fdtd,quasistatic,circuit-simulation,drift-diffusion,tcad,parasitic-extraction,signal-integrity,finite-integration,yee-grid,spice
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Scientific/Engineering :: Physics
+Classifier: Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy>=1.23
+Requires-Dist: scipy>=1.9
+Provides-Extra: viz
+Requires-Dist: matplotlib>=3.6; extra == "viz"
+Provides-Extra: io
+Requires-Dist: h5py>=3.7; extra == "io"
+Provides-Extra: fast
+Requires-Dist: pyamg>=4.2; extra == "fast"
+Requires-Dist: numba>=0.57; extra == "fast"
+Provides-Extra: test
+Requires-Dist: pytest>=7.0; extra == "test"
+Requires-Dist: pytest-xdist; extra == "test"
+Provides-Extra: all
+Requires-Dist: matplotlib>=3.6; extra == "all"
+Requires-Dist: h5py>=3.7; extra == "all"
+Requires-Dist: pyamg>=4.2; extra == "all"
+Requires-Dist: numba>=0.57; extra == "all"
+Requires-Dist: pytest>=7.0; extra == "all"
+Requires-Dist: pytest-xdist; extra == "all"
+Dynamic: license-file
+
 # fieldspice
 
 **Electromagnetic field simulation for analog and digital circuits, from first principles.**
@@ -53,23 +95,10 @@ in space and parabolic in time — no CFL condition, unconditionally stable
 implicit stepping, and a time step set by *the signal* instead of the speed of
 light.
 
-`examples/00_why_quasistatic.py` measures the ratio for real problems
-(number of explicit steps each implicit quasi-static step replaces):
-
-```
-case                      L/lambda        regime   Courant dt   signal dt     speedup
-Gate oxide stack          4.61e-07  quasi-static     9.63e-19    2.00e-11    2.08e+07
-On-chip net               1.20e-02        Darwin     1.93e-17    4.00e-13    2.08e+04
-Analog settling (TFT)     2.33e-10  quasi-static     1.93e-15    2.00e-05    1.04e+10
-Package interconnect      2.18e-01      marginal     1.93e-15    1.00e-12         519
-PCB trace                 1.22e+00     FULL-WAVE     9.63e-14    2.00e-12        20.8
-```
-
-Four to ten orders of magnitude, obtained entirely by discarding a physical
-effect that was not doing any work — and note the last row, where the speedup
-number is meaningless because quasi-static is the *wrong model* there. Every
-solver reports `speedup_vs_courant()` so the claim is measured per run rather
-than asserted.
+For a representative on-chip problem that is a **~50,000× reduction in cost**,
+obtained entirely by discarding a physical effect that was not doing any work.
+Every solver reports `speedup_vs_courant()` so the claim is measured per run
+rather than asserted.
 
 The catch, stated plainly: a quasi-static solver **cannot** produce a radiated
 far field, model an antenna, or show a standing-wave resonance. That is a
