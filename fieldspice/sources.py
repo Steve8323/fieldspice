@@ -64,6 +64,18 @@ you want the algebra::
 
     v = Waveform(sine(1 * GHz, amp=0.2)) + Waveform(step(1 * ns, trise=50 * ps))
     noisy_clock = Waveform(trapezoid_clock(1 * ns)).delay(120 * ps) * 1.8
+
+Declared deviation from ``docs/CONTRACTS.md``
+---------------------------------------------
+:func:`step`, :func:`pulse`, :func:`prbs` and :func:`trapezoid_clock` each take
+one parameter the contract does not list: ``shape``, selecting the edge
+profile.  It is **keyword-only**, so every positional slot in the contract
+signature is exactly as published and any contract-conforming call site is
+unaffected; the deviation is purely additive.  It is declared here rather than
+silently introduced, as ``docs/CONTRACTS.md`` requires.  The justification is in
+"Rise time" above: the choice between a C0 and a C2 edge changes the
+high-frequency content of the excitation by two decades per decade of
+frequency, and that is a physics knob, not a cosmetic one.
 """
 
 from __future__ import annotations
@@ -130,10 +142,12 @@ rather than trusted.
 _PRBS_MAX_CACHE = 1 << 24
 """Largest number of PRBS bits ever materialised (16 Mibit, 16 MB as uint8).
 
-Orders up to 23 have a shorter period than this and are cached whole.  Order 31
-would need 2 GB for a full period, so it is generated lazily and refuses to run
-past this many bits --- at 1 Gb/s that is 16.8 ms of simulated time, which is
-several orders of magnitude more than any transient field solve will reach.
+Bits are generated lazily, only as far into the pattern as a caller actually
+evaluates, and the cache is additionally capped at one period.  Orders up to 23
+have a period shorter than this limit and so can never trip it.  Order 31 would
+need 2 GB for a full period, so it is the only order that can, and it does so
+only past this many bits --- at 1 Gb/s, 16.8 ms of simulated time, several
+orders of magnitude more than any transient field solve will reach.
 """
 
 
@@ -210,11 +224,133 @@ def _require_shape(shape: str) -> str:
     return shape
 
 
+def _lfsr_state0(order: int, seed: int) -> int:
+    """Initial LFSR register contents (dimensionless).
+
+    ``0`` maps to the all-ones state because the all-zero state is the LFSR's
+    fixed point and would emit nothing but zeros.
+    """
+    mask = (1 << order) - 1
+    return (int(seed) & mask) or mask
+
+
+def _lfsr_step_back(order: int, state: int, n: int) -> int:
+    """Run the register ``n`` shifts *backwards*, returning the earlier state.
+
+    Parameters
+    ----------
+    order
+        LFSR order; a key of :data:`PRBS_TAPS`.  Dimensionless.
+    state
+        Current register contents, dimensionless.
+    n
+        Number of shifts to undo.  Dimensionless.
+
+    Returns
+    -------
+    int
+        The register contents ``n`` shifts earlier.
+
+    Notes
+    -----
+    The forward shift is a bijection on the ``2^order - 1`` nonzero states, so it
+    has an inverse and it is cheap: the low ``order-1`` bits of the earlier state
+    are the high bits of the current one, and the bit that was shifted off the
+    top is recovered from the feedback relation as
+    ``current[0] ^ current[k]`` (valid because ``k <= order - 1`` for every
+    polynomial in :data:`PRBS_TAPS`).
+
+    This is what makes negative time affordable.  Reaching bit ``-1`` by walking
+    *forward* would take ``2^order - 1`` steps --- 2.1e9 for PRBS31 --- whereas
+    walking backward takes one.
+    """
+    nn, kk = PRBS_TAPS[order]
+    state = int(state)
+    top_shift = nn - 1
+    for _ in range(int(n)):
+        top = (state & 1) ^ ((state >> kk) & 1)
+        state = (state >> 1) | (top << top_shift)
+    return state
+
+
+def _lfsr_bits(order: int, n: int, state: int,
+               prefix: np.ndarray | None = None) -> np.ndarray:
+    """``n`` bits of the order-``order`` m-sequence as ``uint8`` 0/1.
+
+    Parameters
+    ----------
+    order
+        LFSR order; a key of :data:`PRBS_TAPS`.  Dimensionless.
+    n
+        Number of bits to produce.  Dimensionless.
+    state
+        Register contents *before* the first produced bit, dimensionless.  Use
+        :func:`_lfsr_state0` for the start of the pattern.
+    prefix
+        Bits already known for this ``(order, state)``, reused verbatim so that a
+        growing cache never regenerates what it already holds.
+
+    Returns
+    -------
+    np.ndarray
+        Shape ``(n,)``, dtype ``uint8``.
+
+    Notes
+    -----
+    The bit-at-a-time Fibonacci shift is only used for the first ``order`` bits,
+    which are the only ones that still depend on the register rather than on
+    earlier output.  From there the sequence obeys the two-term recurrence
+    ``b[i] = b[i-n] ^ b[i-k]``, and *squaring is free over GF(2)*:
+    ``(x^n + x^(n-k) + 1)^2 = x^2n + x^2(n-k) + 1``, so the same recurrence
+    holds at every doubled lag ``b[i] = b[i - 2^m n] ^ b[i - 2^m k]`` as soon as
+    ``i >= 2^m n``.  Always taking the largest already-available lag makes each
+    vector block about ``k/n`` of the bits produced so far, so the length grows
+    geometrically and a full 8.4 Mibit PRBS23 period costs O(log n) NumPy
+    operations instead of 8.4e6 Python iterations.
+    """
+    n = int(n)
+    out = np.empty(max(n, 0), dtype=np.uint8)
+    if n <= 0:
+        return out
+
+    nn, kk = PRBS_TAPS[order]
+    mask = (1 << order) - 1
+    hi, lo = nn - 1, kk - 1
+
+    head = min(n, nn)
+    state = int(state)
+    for i in range(head):
+        fb = ((state >> hi) ^ (state >> lo)) & 1
+        state = ((state << 1) | fb) & mask
+        out[i] = fb
+
+    i = head
+    if prefix is not None and prefix.size > i:
+        have = min(int(prefix.size), n)
+        out[i:have] = prefix[i:have]
+        i = have
+
+    while i < n:
+        # Largest doubling whose history is already written.  i >= nn always
+        # holds here (head == nn whenever the loop can run at all), so m = 0 is
+        # admissible and the search terminates.
+        m = 0
+        while (nn << (m + 1)) <= i:
+            m += 1
+        lag_n, lag_k = nn << m, kk << m
+        blk = min(lag_k, n - i)  # blk <= lag_k keeps source and target disjoint
+        np.bitwise_xor(out[i - lag_n:i - lag_n + blk],
+                       out[i - lag_k:i - lag_k + blk],
+                       out=out[i:i + blk])
+        i += blk
+    return out
+
+
 # ==========================================================================
 # Elementary waveforms
 # ==========================================================================
 def step(t0: float, v0: float = 0.0, v1: float = 1.0, trise: float = 0.0,
-         shape: str = "linear") -> TimeFunc:
+         *, shape: str = "linear") -> TimeFunc:
     """A level change from ``v0`` to ``v1`` at time ``t0``.
 
     Parameters
@@ -234,7 +370,9 @@ def step(t0: float, v0: float = 0.0, v1: float = 1.0, trise: float = 0.0,
         edge over a step, trapezoidal rings at the Nyquist frequency forever.
         Use ``trise >= 20*dt`` and the problem disappears.
     shape
-        Edge profile, one of :data:`EDGE_SHAPES`.  Ignored when ``trise == 0``.
+        Edge profile, one of :data:`EDGE_SHAPES`.  Keyword-only; see the
+        module docstring for why it is not in the contract signature.
+        Ignored when ``trise == 0``.
 
     Returns
     -------
@@ -264,7 +402,8 @@ def step(t0: float, v0: float = 0.0, v1: float = 1.0, trise: float = 0.0,
 
 def pulse(t0: float, width: float, v0: float = 0.0, v1: float = 1.0,
           trise: float = 0.0, tfall: float = 0.0,
-          period: float | None = None, shape: str = "linear") -> TimeFunc:
+          period: float | None = None, *,
+          shape: str = "linear") -> TimeFunc:
     """A single pulse or a periodic pulse train, SPICE ``PULSE`` semantics.
 
     The segment layout inside one period, measured from ``t0``:
@@ -288,7 +427,7 @@ def pulse(t0: float, width: float, v0: float = 0.0, v1: float = 1.0,
         Repetition period [s], or ``None`` for a single pulse.  Must be at
         least ``trise + width + tfall``.
     shape
-        Edge profile, one of :data:`EDGE_SHAPES`.
+        Edge profile, one of :data:`EDGE_SHAPES`.  Keyword-only.
 
     Returns
     -------
@@ -563,21 +702,11 @@ def prbs_sequence(order: int = 7, n: int | None = None,
         raise ValueError(
             f"refusing to materialise {n} PRBS bits; limit is {_PRBS_MAX_CACHE}")
 
-    nn, kk = PRBS_TAPS[order]
-    mask = period  # 2**order - 1 is also the all-ones bit mask
-    state = (int(seed) & mask) or mask
-
-    bits = np.empty(n, dtype=np.uint8)
-    hi, lo = nn - 1, kk - 1
-    for i in range(n):
-        fb = ((state >> hi) ^ (state >> lo)) & 1
-        state = ((state << 1) | fb) & mask
-        bits[i] = fb
-    return bits
+    return _lfsr_bits(order, n, _lfsr_state0(order, seed))
 
 
 def prbs(bit_period: float, order: int = 7, v0: float = 0.0, v1: float = 1.0,
-         seed: int = 0, trise: float | None = None,
+         seed: int = 0, trise: float | None = None, *,
          shape: str = "linear") -> TimeFunc:
     """Non-return-to-zero pseudo-random bit stream from a maximal-length LFSR.
 
@@ -602,7 +731,7 @@ def prbs(bit_period: float, order: int = 7, v0: float = 0.0, v1: float = 1.0,
         ``0.2 * bit_period``, a 20% edge, which is a realistic bandwidth-limited
         driver and keeps the eye open.  Must not exceed ``bit_period``.
     shape
-        Edge profile, one of :data:`EDGE_SHAPES`.
+        Edge profile, one of :data:`EDGE_SHAPES`.  Keyword-only.
 
     Returns
     -------
@@ -613,22 +742,33 @@ def prbs(bit_period: float, order: int = 7, v0: float = 0.0, v1: float = 1.0,
     ------
     ValueError
         If ``bit_period <= 0``, ``order`` is unsupported, ``trise`` is negative
-        or longer than a bit, or an evaluation lands past bit
-        ``2**24`` of an order-31 pattern.
+        or longer than a bit, or an evaluation lands past bit ``2**24`` of the
+        pattern.  Only order 31 can reach that last one: every shorter order has
+        a period below the limit.
 
     Notes
     -----
     A PRBS is the right stimulus for interconnect because it contains every
-    ``order``-bit sub-pattern exactly once per period, so it exercises the
-    worst-case inter-symbol interference (the long run of identical bits
-    followed by a lone transition) without anyone having to construct it by
-    hand.  Its power spectral density is ``sinc^2(f*bit_period)`` sampled on a
+    **nonzero** ``order``-bit sub-pattern exactly once per period, so it
+    exercises the worst-case inter-symbol interference (the long run of
+    identical bits followed by a lone transition) without anyone having to
+    construct it by hand.  The all-zero window is the one that is missing, and
+    it is missing necessarily: it is the LFSR's fixed point, so a maximal-length
+    sequence of order ``n`` walks ``2^n - 1`` windows, not ``2^n``.  Its power
+    spectral density is ``sinc^2(f*bit_period)`` sampled on a
     ``1/(period*bit_period)`` comb, i.e. essentially flat to the first null at
     ``1/bit_period``.
 
-    Order matters: PRBS7 has a longest run of 7 identical bits, PRBS31 of 31.
-    If the answer depends on baseline wander or on a low-frequency pole, a short
-    pattern will hide it.
+    That missing window makes the runs asymmetric, which matters if the answer
+    depends on baseline wander: the longest run of ones is ``order`` and the
+    longest run of zeros is ``order - 1`` (7 and 6 for PRBS7, 31 and 30 for
+    PRBS31).  Order matters for the same reason --- a short pattern hides a
+    low-frequency pole because it never asks for a long enough run.
+
+    Negative and zero times are fine.  The pattern is extended periodically, and
+    the level preceding bit 0 --- the last bit of the period --- is recovered
+    from the seed register in O(1) rather than by generating the period, so the
+    first unit interval costs no more than any other.
     """
     bit_period = _require_positive("bit_period", bit_period)
     if order not in PRBS_TAPS:
@@ -644,49 +784,83 @@ def prbs(bit_period: float, order: int = 7, v0: float = 0.0, v1: float = 1.0,
             "an edge longer than a unit interval has no meaning")
 
     period_bits = (1 << order) - 1
-    nn, kk = PRBS_TAPS[order]
-    mask = period_bits
-    hi, lo = nn - 1, kk - 1
 
-    # Lazily grown bit cache.  Orders up to 23 fit whole; order 31 does not, so
-    # bits are produced only as far as the caller actually evaluates.
+    # Lazily grown cache holding one *contiguous window* of the pattern:
+    # ``bits[i]`` is pattern bit ``base + i``, where ``base`` may be negative.
+    # A window rather than a "first n bits" buffer is what makes t <= 0 work.
+    # Every evaluation needs the bit before the earliest one it lands on (that
+    # is the level the edge rises from), and taking that predecessor modulo the
+    # period would ask for bit ``period - 1`` --- the far end of the pattern, so
+    # 2.1e9 bits at order 31, past the generation limit.  Every run starting at
+    # t = 0 therefore used to fail.  Walking the register one shift *backwards*
+    # costs O(1) and gives the same bit.
     cache: dict[str, object] = {
+        "base": 0,
+        "state": _lfsr_state0(order, seed),   # register contents at index base
         "bits": np.empty(0, dtype=np.uint8),
-        "state": (int(seed) & mask) or mask,
     }
 
-    def _ensure(n_needed: int) -> np.ndarray:
-        bits: np.ndarray = cache["bits"]  # type: ignore[assignment]
-        if n_needed <= bits.size:
-            return bits
-        if n_needed > _PRBS_MAX_CACHE:
-            raise ValueError(
-                f"prbs evaluation needs bit {n_needed - 1} of the pattern, past "
+    def _window(lo: int, hi: int) -> tuple[np.ndarray, int]:
+        """Bits covering pattern indices ``[lo, hi]``; returns ``(bits, base)``."""
+        base: int = cache["base"]            # type: ignore[assignment]
+        bits: np.ndarray = cache["bits"]     # type: ignore[assignment]
+
+        def _too_long(n_bits: int, index: int) -> ValueError:
+            return ValueError(
+                f"prbs evaluation needs bit {index} of the pattern, past "
                 f"the {_PRBS_MAX_CACHE}-bit generation limit "
                 f"({_PRBS_MAX_CACHE * bit_period:.4g} s of pattern)")
-        target = min(max(n_needed, 2 * bits.size, 4096),
-                     period_bits, _PRBS_MAX_CACHE)
-        target = max(target, n_needed)
-        grown = np.empty(target, dtype=np.uint8)
-        grown[:bits.size] = bits
-        state = int(cache["state"])  # type: ignore[arg-type]
-        for i in range(bits.size, target):
-            fb = ((state >> hi) ^ (state >> lo)) & 1
-            state = ((state << 1) | fb) & mask
-            grown[i] = fb
-        cache["bits"] = grown
-        cache["state"] = state
-        return grown
+
+        if lo < base:
+            n_pre = base - lo
+            if n_pre + bits.size > _PRBS_MAX_CACHE:
+                raise _too_long(n_pre + bits.size, lo)
+            state = _lfsr_step_back(order, int(cache["state"]), n_pre)
+            bits = np.concatenate([_lfsr_bits(order, n_pre, state), bits])
+            base, cache["state"] = lo, state
+
+        n_need = hi - base + 1
+        if n_need > bits.size:
+            if n_need > _PRBS_MAX_CACHE:
+                raise _too_long(n_need, hi)
+            # Grow geometrically, but never hold more than one period ahead of
+            # base: past that the pattern repeats and indexing can wrap instead.
+            target = min(max(n_need, 2 * bits.size, 4096),
+                         period_bits - base, _PRBS_MAX_CACHE)
+            target = max(target, n_need)
+            bits = _lfsr_bits(order, target, int(cache["state"]), prefix=bits)
+
+        cache["base"], cache["bits"] = base, bits
+        return bits, base
 
     def f(t: float | np.ndarray) -> float | np.ndarray:
         arr, scalar = _as_time(t)
         u = arr / bit_period
         k = np.floor(u)
         frac = (u - k) * bit_period                     # time into the bit [s]
-        idx = np.mod(k, period_bits).astype(np.int64)   # wraps negative t too
-        prev = np.mod(k - 1.0, period_bits).astype(np.int64)
-        bits = _ensure(int(max(idx.max(initial=0), prev.max(initial=0))) + 1)
-        b_now = np.where(bits[idx] > 0, v1, v0)
+        if arr.size == 0:
+            return _out(np.zeros(arr.shape), scalar, arr.shape)
+
+        # Slide the requested bit indices by a whole number of periods so they
+        # sit near the origin.  The pattern is period_bits-periodic, so this is
+        # exact, and it keeps the cached window near index 0 however far out in
+        # time the caller is evaluating.
+        ki = k.astype(np.int64)
+        kmin = int(ki.min())
+        j = ki - ((kmin + period_bits // 2) // period_bits) * period_bits
+
+        lo, hi = int(j.min()) - 1, int(j.max())
+        if hi - lo + 1 > period_bits:
+            # Spanning a whole period or more: hold it once and wrap the indices.
+            bits, base = _window(0, period_bits - 1)
+            now = np.mod(j, period_bits) - base
+            prev = np.mod(j - 1, period_bits) - base
+        else:
+            bits, base = _window(lo, hi)
+            now = j - base
+            prev = now - 1
+
+        b_now = np.where(bits[now] > 0, v1, v0)
         b_prev = np.where(bits[prev] > 0, v1, v0)
         out = b_prev + (b_now - b_prev) * _ramp01(frac, trise, shape)
         return _out(out, scalar, arr.shape)
@@ -696,7 +870,7 @@ def prbs(bit_period: float, order: int = 7, v0: float = 0.0, v1: float = 1.0,
 
 def trapezoid_clock(period: float, duty: float = 0.5,
                     trise: float | None = None, tfall: float | None = None,
-                    v0: float = 0.0, v1: float = 1.0,
+                    v0: float = 0.0, v1: float = 1.0, *,
                     shape: str = "linear") -> TimeFunc:
     """Periodic trapezoidal clock with finite edges and a specified duty cycle.
 
@@ -722,7 +896,8 @@ def trapezoid_clock(period: float, duty: float = 0.5,
     v0, v1
         Low and high levels [V] (or [A]).
     shape
-        Edge profile, one of :data:`EDGE_SHAPES`.  ``"linear"`` preserves the
+        Edge profile, one of :data:`EDGE_SHAPES`.  Keyword-only.
+        ``"linear"`` preserves the
         exact mean above; so do the other two, because every profile in
         :data:`EDGE_SHAPES` is antisymmetric about the midpoint of its edge.
 

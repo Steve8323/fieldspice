@@ -129,11 +129,38 @@ def _resolve_index(index: int | None, n: int, what: str) -> int:
     return idx
 
 
+def _reject_complex(arr: np.ndarray, what: str) -> None:
+    """Refuse a complex array instead of silently plotting its real part.
+
+    :class:`~fieldspice.solvers.ac.ACSolver` produces complex phasors, so a
+    complex field is a realistic input rather than a typo.  Casting it to float
+    drops the imaginary part behind a NumPy ``ComplexWarning`` --- a warning
+    that is routinely filtered out in notebooks --- and nothing on the axes
+    would reveal that the picture is not the field.  For a pure phase ramp the
+    plotted values sweep the full colour range while the true magnitude is
+    exactly uniform.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Array to test.
+    what : str
+        Name of the argument, used in the error message.
+    """
+    if np.iscomplexobj(arr):
+        raise ValueError(
+            f"{what} is complex (an AC phasor?); refusing to plot its real "
+            "part silently. Pass np.abs(f) for magnitude, np.real(f) or "
+            "np.imag(f) for one phasor component, or np.angle(f) [rad] for "
+            "phase")
+
+
 def _as_node_field(grid: RectilinearGrid, field: np.ndarray) -> np.ndarray:
     """Coerce a flat or shaped nodal field to ``grid.shape_nodes``."""
     arr = np.asarray(field)
     if arr.dtype == object:
         raise ValueError("field must be a numeric array")
+    _reject_complex(arr, "nodal field")
     arr = arr.astype(float, copy=False)
     if arr.shape == grid.shape_nodes:
         return arr
@@ -147,6 +174,7 @@ def _as_node_field(grid: RectilinearGrid, field: np.ndarray) -> np.ndarray:
 def _as_cell_field(grid: RectilinearGrid, field: np.ndarray) -> np.ndarray:
     """Coerce a flat or shaped cell field to ``grid.shape_cells``."""
     arr = np.asarray(field)
+    _reject_complex(arr, "cell field")
     if arr.shape == grid.shape_cells:
         return arr
     if arr.size == grid.n_cells and arr.ndim == 1:
@@ -167,12 +195,26 @@ def _plane_title(grid: RectilinearGrid, axis: int, index: int,
     return f"{_AXIS_NAMES[axis]} = {coord:.4g} m ({kind} {index})"
 
 
-def _finish_axes(ax, axis: int, aspect: str | float,
+def _is_collapsed(grid: RectilinearGrid, axis: int) -> bool:
+    """True when ``axis`` is a collapsed (bookkeeping) direction of ``grid``."""
+    return bool((grid.ax, grid.ay, grid.az)[axis].collapsed)
+
+
+def _finish_axes(ax, grid: RectilinearGrid, axis: int, aspect: str | float,
                  title: str | None) -> None:
     u, w = _in_plane_axes(axis)
     ax.set_xlabel(_label(u))
     ax.set_ylabel(_label(w))
     if aspect is not None:
+        # A collapsed direction carries a bookkeeping thickness (1 m by
+        # default), not physical extent, so "equal" against a resolved
+        # micron-scale direction is a ~1e6:1 data aspect: matplotlib shrinks
+        # the axes box to zero width and the figure comes out blank.  Every 1D
+        # device plot hits this.  A numeric aspect is an explicit request and
+        # is always honoured, which is the escape hatch.
+        if (isinstance(aspect, str) and aspect == "equal"
+                and (_is_collapsed(grid, u) or _is_collapsed(grid, w))):
+            aspect = "auto"
         ax.set_aspect(aspect)
     if title:
         ax.set_title(title)
@@ -234,9 +276,14 @@ def _scalar_norm(data: np.ndarray, log: bool, cmap: str | None,
     if dmin < 0.0:
         lin = float(nz.min())
         lin = min(max(lin, amax * 1e-12), amax * 0.1)
-        lim = amax if vmax is None else abs(float(vmax))
+        # Honour vmin/vmax exactly as the linear branch does.  Imposing a
+        # symmetric range here would discard a user-supplied vmin with no
+        # warning, so the same call would behave differently with log=True.
+        lo = -amax if vmin is None else float(vmin)
+        hi = amax if vmax is None else float(vmax)
+        lo, hi = _widen(lo, hi)
         return (data, cmap,
-                mcolors.SymLogNorm(linthresh=lin, vmin=-lim, vmax=lim, base=10))
+                mcolors.SymLogNorm(linthresh=lin, vmin=lo, vmax=hi, base=10))
 
     masked = np.ma.masked_less_equal(data, 0.0)
     lo = float(nz.min()) if vmin is None else float(vmin)
@@ -281,7 +328,12 @@ def plot_grid(grid: RectilinearGrid, ax=None, *, plane: str | int = "z",
         line is drawn (the last line always included) and the title says so, so
         the picture is never quietly wrong about mesh density.
     aspect : str or float
-        Passed to ``ax.set_aspect``; ``"equal"`` shows true geometry.
+        Passed to ``ax.set_aspect``; ``"equal"`` shows true geometry.  It is
+        demoted to ``"auto"`` when either in-plane direction is *collapsed*,
+        because a collapsed direction carries only a bookkeeping thickness
+        (1 m by default) and equal aspect against a micron-scale resolved
+        direction would shrink the axes box to zero width --- which is every
+        1D device plot.  Pass a number (``1.0``) to force true aspect anyway.
     title : str or None
         Overrides the generated title.
     **kw
@@ -320,7 +372,7 @@ def plot_grid(grid: RectilinearGrid, ax=None, *, plane: str | int = "z",
                  f"{nu} x {nw} cells")
         if su > 1 or sw > 1:
             title += f" (1 line in {su} / 1 in {sw} drawn)"
-    _finish_axes(ax, axis, aspect, title)
+    _finish_axes(ax, grid, axis, aspect, title)
     return ax
 
 
@@ -417,7 +469,7 @@ def plot_materials(matmap: Any, plane: str | int = "z",
         ax.legend(handles=[Patch(facecolor=c, edgecolor="none", label=l)
                            for c, l in zip(colors, labels)],
                   loc="best", fontsize="small", framealpha=0.85)
-    _finish_axes(ax, axis, aspect,
+    _finish_axes(ax, grid, axis, aspect,
                  title if title is not None
                  else "materials, " + _plane_title(grid, axis, idx, nodal=False))
     return ax
@@ -449,27 +501,58 @@ def _categorical_colors(n: int) -> list[Any]:
 # ==========================================================================
 # Scalar node fields
 # ==========================================================================
+def _dual_box_edges(nodes: np.ndarray) -> np.ndarray:
+    """Faces of the box-method dual control volumes around ``nodes`` [m].
+
+    ``n`` node coordinates give ``n + 1`` faces: interior faces sit at the cell
+    midpoints and the two outer faces sit **on** the boundary nodes, so the
+    boundary control volumes are half cells.  This reproduces ``grid.hxd`` /
+    ``hyd`` / ``hzd`` exactly (assumption A10).
+
+    Parameters
+    ----------
+    nodes : np.ndarray
+        Increasing node coordinates along one axis [m].
+
+    Returns
+    -------
+    np.ndarray
+        ``(n + 1,)`` dual-box face coordinates [m].
+    """
+    return np.concatenate([nodes[:1], 0.5 * (nodes[:-1] + nodes[1:]),
+                           nodes[-1:]])
+
+
 def _pcolor_nodal(grid: RectilinearGrid, data2d: np.ndarray, axis: int, ax,
                   cmap: str | None, norm: Any, shading: str, **kw: Any):
     """Draw one nodal slice with true node coordinates.  Returns the QuadMesh.
 
     ``shading="gouraud"`` treats node values as the point samples they are and
     interpolates bilinearly between the true node positions.  ``"flat"``
-    averages the four corner nodes of each cell and fills the cell.  Either way
-    the quadrilateral geometry is the real (graded) mesh --- this is why
-    ``imshow`` is never an option here.
+    averages the four corner nodes of each cell and fills the cell.
+    ``"nearest"`` fills each node's dual control volume, whose faces are built
+    here explicitly.  Either way the quadrilateral geometry is the real
+    (graded) mesh --- this is why ``imshow`` is never an option here.
     """
     u_ax, w_ax = _in_plane_axes(axis)
-    U, W = np.meshgrid(_node_axis(grid, u_ax), _node_axis(grid, w_ax),
-                       indexing="ij")
+    un, wn = _node_axis(grid, u_ax), _node_axis(grid, w_ax)
     if shading == "gouraud":
+        U, W = np.meshgrid(un, wn, indexing="ij")
         c = data2d
     elif shading == "nearest":
-        # Node coordinates as cell CENTRES: matplotlib puts the quad edges at
-        # the midpoints, which is exactly the dual control volume of the box
-        # method (assumption A10).
+        # The dual-box faces are built explicitly rather than letting
+        # pcolormesh treat the nodes as cell centres: matplotlib extrapolates
+        # its outer edges a full half cell PAST the first and last node, which
+        # draws the two boundary control volumes at twice their true width and
+        # paints field outside the domain (45% of the domain width on a 1000:1
+        # graded mesh).  The box method's boundary volume is a half cell that
+        # terminates at the wall.
+        U, W = np.meshgrid(_dual_box_edges(un), _dual_box_edges(wn),
+                           indexing="ij")
         c = data2d
+        shading = "flat"          # (nu+1, nw+1) faces around (nu, nw) values
     elif shading == "flat":
+        U, W = np.meshgrid(un, wn, indexing="ij")
         c = 0.25 * (data2d[:-1, :-1] + data2d[1:, :-1]
                     + data2d[:-1, 1:] + data2d[1:, 1:])
     else:
@@ -549,7 +632,7 @@ def plot_scalar(grid: RectilinearGrid, field: np.ndarray,
         cb = ax.get_figure().colorbar(mesh, ax=ax)
         if label:
             cb.set_label(label)
-    _finish_axes(ax, axis, aspect,
+    _finish_axes(ax, grid, axis, aspect,
                  title if title is not None
                  else _plane_title(grid, axis, idx, nodal=True))
     return ax
@@ -615,7 +698,11 @@ def plot_vector(grid: RectilinearGrid, edge_vec: np.ndarray,
     :func:`fieldspice.operators.interpolate_edges_to_nodes` is documented as
     post-processing only.  Never feed the interpolated field back into a solver.
     """
-    vec = np.asarray(edge_vec, dtype=float).ravel()
+    vec = np.asarray(edge_vec)
+    if vec.dtype == object:
+        raise ValueError("edge_vec must be a numeric array")
+    _reject_complex(vec, "edge_vec")
+    vec = vec.astype(float, copy=False).ravel()
     if vec.size != grid.n_edges:
         raise ValueError(
             f"edge_vec must have {grid.n_edges} entries, got {vec.size}")
@@ -647,7 +734,7 @@ def plot_vector(grid: RectilinearGrid, edge_vec: np.ndarray,
     if colorbar:
         cb = ax.get_figure().colorbar(q, ax=ax)
         cb.set_label(label if label else "magnitude")
-    _finish_axes(ax, axis, aspect,
+    _finish_axes(ax, grid, axis, aspect,
                  title if title is not None
                  else _plane_title(grid, axis, idx, nodal=True))
     return ax
@@ -883,11 +970,15 @@ def animate(result: Any, field: str | np.ndarray, plane: str | int = "z",
         if field not in fields:
             raise ValueError(
                 f"result has no stored field {field!r}; have {list(fields)}")
-        hist = np.asarray(fields[field], dtype=float)
+        hist = np.asarray(fields[field])
         fname = field
     else:
-        hist = np.asarray(field, dtype=float)
+        hist = np.asarray(field)
         fname = "field"
+    if hist.dtype == object:
+        raise ValueError("field history must be a numeric array")
+    _reject_complex(hist, "field history")
+    hist = hist.astype(float, copy=False)
     if hist.ndim < 2 or hist.shape[1:] not in (grid.shape_nodes,
                                                (grid.n_nodes,)):
         raise ValueError(
@@ -901,11 +992,15 @@ def animate(result: Any, field: str | np.ndarray, plane: str | int = "z",
     frames = np.arange(0, nt, int(every))
     if frames.size == 0:
         raise ValueError("no frames to animate")
-    stack = np.stack([_as_node_field(grid, hist[k]) for k in frames])
 
     axis = _axis_of(plane)
     idx = _resolve_index(index, grid.shape_nodes[axis], "node")
-    slices = np.take(stack, idx, axis=axis + 1)      # (nf, nu, nw)
+    # Slice each frame as it is coerced.  Materialising the selected history
+    # first and slicing afterwards would transiently hold the whole 3D record
+    # in memory (a 60^3 grid over 40 steps costs 73 MB) purely to display 1 MB
+    # of 2D cuts, which is the difference between running and running out.
+    slices = np.stack([np.take(_as_node_field(grid, hist[k]), idx, axis=axis)
+                       for k in frames])       # (nf, nu, nw)
 
     # One global norm for the whole movie, so brightness means the same thing
     # in every frame.
@@ -924,7 +1019,7 @@ def animate(result: Any, field: str | np.ndarray, plane: str | int = "z",
     if colorbar:
         cb = ax.get_figure().colorbar(mesh, ax=ax)
         cb.set_label(label if label else fname)
-    _finish_axes(ax, axis, aspect,
+    _finish_axes(ax, grid, axis, aspect,
                  f"{fname}, {_plane_title(grid, axis, idx, nodal=True)}")
     text = ax.text(0.02, 0.98, tlabel.format(times[0]), transform=ax.transAxes,
                    va="top", ha="left", fontsize="small")
@@ -1142,6 +1237,10 @@ def eye_diagram(t: np.ndarray, v: np.ndarray, period: float, ax=None, *,
         discard a startup transient.
     offset : float
         Extra phase shift [s] applied when sampling, for centring the eye.
+        Either sign is allowed; fold windows that would begin before the first
+        sample are skipped whole periods at a time rather than interpolated
+        against the end of the record, so a negative offset costs at most one
+        trace and never invents one.
     max_traces : int or None
         Cap on the number of drawn traces (the most recent ones are kept), for
         very long records.
@@ -1174,23 +1273,45 @@ def eye_diagram(t: np.ndarray, v: np.ndarray, period: float, ax=None, *,
     t0 = float(t[0]) if t_start is None else float(t_start)
     if not t[0] - 1e-15 <= t0 <= t[-1]:
         raise ValueError("t_start lies outside the sampled record")
-    span = t[-1] - t0 - offset
+    if not np.isfinite(offset):
+        raise ValueError("offset must be a finite time in seconds")
+
+    # A negative offset -- the natural way to type "centre the eye" -- puts the
+    # first fold window before the record.  np.interp clamps to v[0] there, so
+    # the trace would be a flat line sitting on the decision level: a fabricated
+    # runt that closes the measured eye opening, which is the one number an eye
+    # diagram exists to report.  Skip whole periods until the first window is
+    # inside the record instead, which keeps the phase alignment the offset
+    # asked for.
+    base = t0 + float(offset)
+    n_skip = int(np.ceil((t[0] - base) / period - 1e-12))
+    if n_skip > 0:
+        base += n_skip * period
+    base = max(base, float(t[0]))       # absorb the rounding of the ceil
+
+    span = t[-1] - base
     n_per = int(np.floor(span / period))
     if n_per < 1:
         raise ValueError(
-            f"record spans {span:.4g} s after t_start, less than one period "
-            f"({period:.4g} s); nothing to fold")
+            f"record spans {span:.4g} s after t_start + offset, less than one "
+            f"period ({period:.4g} s); nothing to fold")
     if max_traces is not None and max_traces < 1:
         raise ValueError("max_traces must be >= 1")
 
     phase = np.linspace(0.0, period, int(n_phase))
-    starts = t0 + offset + period * np.arange(n_per)
+    starts = base + period * np.arange(n_per)
     if max_traces is not None and n_per > max_traces:
         starts = starts[-int(max_traces):]
 
     # Resample every window onto the shared phase grid; np.interp handles the
     # non-integer samples-per-period case exactly.
     sample_t = starts[:, None] + phase[None, :]
+    if sample_t[0, 0] < t[0] or sample_t[-1, -1] > t[-1]:
+        # Unreachable given the window arithmetic above; kept because the
+        # failure mode it guards against (np.interp clamping) is silent.
+        raise ValueError(
+            f"fold windows [{sample_t[0, 0]:.6g}, {sample_t[-1, -1]:.6g}] s "
+            f"leave the record [{t[0]:.6g}, {t[-1]:.6g}] s")
     folded = np.interp(sample_t.ravel(), t, v).reshape(sample_t.shape)
 
     ax, _ = _get_ax(ax, figsize=(6.0, 4.0))

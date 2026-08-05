@@ -95,6 +95,19 @@ class UnknownMaterial(KeyError, ValueError):
     """
 
 
+def _check_T(T: float) -> float:
+    """Validate a lattice temperature [K] and return it as a float.
+
+    Every temperature-dependent method funnels through this so that none of
+    them can silently return a negative diffusivity or a complex-valued
+    density of states for a nonsensical input.
+    """
+    T = float(T)
+    if not np.isfinite(T) or T <= 0.0:
+        raise ValueError(f"temperature must be positive [K], got {T}")
+    return T
+
+
 # ==========================================================================
 # Semiconductor parameters
 # ==========================================================================
@@ -214,9 +227,7 @@ class SemiconductorParams:
         float
             Bandgap [eV].
         """
-        T = float(T)
-        if T <= 0.0:
-            raise ValueError(f"temperature must be positive [K], got {T}")
+        T = _check_T(T)
         if self.varshni_alpha == 0.0:
             return self.Eg
         a, b = self.varshni_alpha, self.varshni_beta
@@ -232,17 +243,11 @@ class SemiconductorParams:
         effective mass.  The residual temperature dependence of ``m*`` is a few
         percent over 200-500 K and is not modelled.
         """
-        T = float(T)
-        if T <= 0.0:
-            raise ValueError(f"temperature must be positive [K], got {T}")
-        return self.Nc_300 * (T / T_ROOM) ** 1.5
+        return self.Nc_300 * (_check_T(T) / T_ROOM) ** 1.5
 
     def Nv(self, T: float = T_ROOM) -> float:
         """Valence-band effective density of states at ``T`` [m^-3]. ``T^(3/2)``."""
-        T = float(T)
-        if T <= 0.0:
-            raise ValueError(f"temperature must be positive [K], got {T}")
-        return self.Nv_300 * (T / T_ROOM) ** 1.5
+        return self.Nv_300 * (_check_T(T) / T_ROOM) ** 1.5
 
     # -- intrinsic concentration -------------------------------------------
     def ni(self, T: float = T_ROOM) -> float:
@@ -262,9 +267,9 @@ class SemiconductorParams:
         replaced by whatever prefactor reproduces ``ni_300``.
 
         **Why anchor.**  The textbook silicon triple (``Nc = 2.8e19 cm^-3``,
-        ``Nv = 1.04e19 cm^-3``, ``Eg = 1.12 eV``) does *not* reproduce the
-        measured ``ni(300) = 1.0e10 cm^-3``; it gives ``6.2e9 cm^-3``, low by
-        about 38 percent.  This is a well-known inconsistency in the standard
+        ``Nv = 1.04e19 cm^-3``, ``Eg = 1.124 eV``) does *not* reproduce the
+        measured ``ni(300) = 9.65e9 cm^-3``; it gives ``6.18e9 cm^-3``, low by
+        36 percent.  This is a well-known inconsistency in the standard
         tables: the quoted ``Nv`` uses a single heavy-hole mass and ignores the
         light-hole and split-off bands and the temperature dependence of the
         density-of-states mass, while ``ni`` is the directly measured quantity
@@ -292,9 +297,7 @@ class SemiconductorParams:
         ~1e19 cm^-3 needs Fermi-Dirac and bandgap narrowing, neither of which
         is applied here.
         """
-        T = float(T)
-        if T <= 0.0:
-            raise ValueError(f"temperature must be positive [K], got {T}")
+        T = _check_T(T)
         Vt = kB * T / q
         Vt0 = kB * T_ROOM / q
         expo = self.Eg / (2.0 * Vt0) - self.Eg_at(T) / (2.0 * Vt)
@@ -307,37 +310,42 @@ class SemiconductorParams:
         so the inconsistency described in :meth:`ni` is measurable rather than
         asserted.
         """
-        Vt = kB * float(T) / q
+        Vt = kB * _check_T(T) / q
         return math.sqrt(self.Nc(T) * self.Nv(T)) * math.exp(-self.Eg_at(T) / (2.0 * Vt))
 
     def dos_consistency(self, T: float = T_ROOM) -> float:
         """``ni_dos(T) / ni(T)``: 1.0 means the parameter set is self-consistent.
 
-        Silicon with the standard textbook triple returns about 0.62.
+        Silicon with the standard textbook triple and the measured
+        ``ni_300 = 9.65e9 cm^-3`` returns 0.640 at 300 K.
         """
         return self.ni_dos(T) / self.ni(T)
 
     def Eg_eff_for_ni(self, T: float = T_ROOM) -> float:
         """Gap [eV] that would reconcile ``Nc``, ``Nv`` and ``ni_300``.
 
-        ``2 kT ln( sqrt(Nc Nv) / ni )``.  For silicon this is 1.099 eV against a
-        true gap of 1.124 eV; the 25 meV difference is the size of the tabulated
+        ``2 kT ln( sqrt(Nc Nv) / ni )``.  For silicon this is 1.101 eV against a
+        true gap of 1.124 eV; the 23 meV difference is the size of the tabulated
         inconsistency, not a physical bandgap narrowing.
         """
-        Vt = kB * float(T) / q
+        Vt = kB * _check_T(T) / q
         return 2.0 * Vt * math.log(math.sqrt(self.Nc(T) * self.Nv(T)) / self.ni(T))
 
     # -- derived transport quantities --------------------------------------
     def D_n(self, T: float = T_ROOM) -> float:
         """Electron diffusivity [m^2/s] from the Einstein relation ``mu kT/q``."""
-        return self.mu_n * kB * float(T) / q
+        return self.mu_n * kB * _check_T(T) / q
 
     def D_p(self, T: float = T_ROOM) -> float:
         """Hole diffusivity [m^2/s] from the Einstein relation ``mu kT/q``."""
-        return self.mu_p * kB * float(T) / q
+        return self.mu_p * kB * _check_T(T) / q
 
     def sigma_intrinsic(self, T: float = T_ROOM) -> float:
-        """Conductivity of the undoped material [S/m], ``q ni (mu_n + mu_p)``."""
+        """Conductivity of the undoped material [S/m], ``q ni (mu_n + mu_p)``.
+
+        For silicon at 300 K this is 2.8294e-4 S/m, which is what the ``si``
+        entry's :attr:`Material.sigma` carries (rounded to 2.83e-4).
+        """
         return q * self.ni(T) * (self.mu_n + self.mu_p)
 
 
@@ -506,7 +514,8 @@ _SI_SEMI = SemiconductorParams(
     varshni_beta=636.0,
     ref=("Sze & Ng 3rd ed. App. G; Green JAP 67, 2944 (1990). "
          "SRH lifetime is float-zone-grade and spans 1e-9..1e-2 s in practice. "
-         "Nv=1.04e19 cm^-3 does not reproduce ni=1e10 cm^-3: see ni()."),
+         "Nv=1.04e19 cm^-3 does not reproduce ni=9.65e9 cm^-3 (it gives "
+         "6.18e9, 36 percent low): see ni()."),
 )
 
 _GAAS_SEMI = SemiconductorParams(
@@ -622,11 +631,13 @@ LIBRARY: dict[str, Material] = {
                   "raises eps_r by ~1e-4 at 50 percent RH; irrelevant here."),
 
     # -- semiconductors ----------------------------------------------------
-    "si": _M("si", eps_r=11.7, sigma=2.9e-4, kind="semiconductor",
+    "si": _M("si", eps_r=11.7, sigma=2.83e-4, kind="semiconductor",
              semi=_SI_SEMI, color="#6a6a80",
              ref="eps_r 11.7 (11.9 is also widely quoted; the spread is real "
                  "and ~2 percent). sigma is the intrinsic value "
-                 "q*ni*(mu_n+mu_p) = 2.9e-4 S/m, i.e. rho = 3.4e5 ohm cm; the "
+                 "q*ni*(mu_n+mu_p) = 2.8294e-4 S/m computed from the ni and "
+                 "mobilities in this very parameter block (check it with "
+                 "semi.sigma_intrinsic(300)), i.e. rho = 3.5e5 ohm cm; the "
                  "frequently quoted 2.3e5 ohm cm dates from the older "
                  "ni = 1.45e10 cm^-3 and is not consistent with the ni used "
                  "here. It applies ONLY when silicon is treated as a lossy "
@@ -646,9 +657,11 @@ LIBRARY: dict[str, Material] = {
                ref="a-IGZO. eps_r 16 is the value fixed by docs/CONTRACTS.md; "
                    "the literature spans 10-16 depending on composition and "
                    "measurement frequency, so treat it as +-40 percent. sigma "
-                   "1e-2 S/m corresponds to n ~ 1e17 cm^-3 at 10 cm^2/Vs and "
-                   "is STRONGLY process dependent -- annealed channel IGZO "
-                   "spans 1e-6..1e2 S/m across the literature."),
+                   "1e-2 S/m corresponds to n ~ 6e13 cm^-3 at 10 cm^2/Vs (a "
+                   "well-annealed, low-carrier film); a conducting channel at "
+                   "n ~ 1e17 cm^-3 would instead be ~16 S/m. sigma is STRONGLY "
+                   "process dependent -- oxygen-vacancy content moves it over "
+                   "1e-6..1e2 S/m across the literature."),
     "a_si": _M("a_si", eps_r=11.9, sigma=1.0e-7, kind="semiconductor",
                semi=_ASI_SEMI, color="#8b7d6b",
                ref="a-Si:H. sigma is the dark conductivity of device-grade "
@@ -895,6 +908,12 @@ def mix_property(old: np.ndarray | float, new: float,
     ``rule="harmonic"`` requires both values to be strictly positive; a zero
     conductivity phase makes the harmonic mean zero, which would disconnect the
     mesh.
+
+    This is the **two-phase** blend.  :meth:`MaterialMap.assign` cannot use it
+    directly for a third phase, because applying it twice would leave a
+    ``(1-f_A)(1-f_B)`` share of the *background* in a cell that the two phases
+    already fill completely; the map therefore tracks a per-cell coverage and
+    accumulates phases with :func:`_accumulate` instead.  See the notes there.
     """
     f = np.asarray(fill, dtype=float)
     o = np.asarray(old, dtype=float)
@@ -907,6 +926,84 @@ def mix_property(old: np.ndarray | float, new: float,
                 "(a zero-valued phase drives the harmonic mean to zero); use "
                 "rule='linear' for conductivity")
         return 1.0 / ((1.0 - f) / o + f / float(new))
+    raise ValueError(f"unknown mixing rule {rule!r}, expected 'linear' or 'harmonic'")
+
+
+_LINEAR = ("linear", "parallel", "arithmetic")
+_HARMONIC = ("harmonic", "series")
+
+
+def _accumulate(prop: np.ndarray, bg: float, new: float,
+                fill: np.ndarray, cov: np.ndarray, rule: str,
+                what: str) -> np.ndarray:
+    """Add one phase to a partially filled cell without re-mixing the background.
+
+    Parameters
+    ----------
+    prop : np.ndarray
+        Current effective property per cell (any units), shape
+        ``grid.shape_cells``.
+    bg : float
+        The background material's value of the same property, same units.
+    new : float
+        The incoming phase's value, same units.
+    fill : np.ndarray
+        Volume fraction of the incoming phase per cell, in ``[0, 1]``.
+    cov : np.ndarray
+        Volume fraction of each cell already occupied by previously assigned
+        phases, in ``[0, 1]``, *before* this call.
+    rule : {"linear", "harmonic"}
+        Effective-medium rule; see :func:`mix_property`.
+    what : str
+        Property name, used only in error messages.
+
+    Returns
+    -------
+    np.ndarray
+        Updated effective property, shape ``grid.shape_cells``.
+
+    Notes
+    -----
+    Tagged **A2**.  The invariant maintained across calls is
+
+    ``T(p_cell) = (1 - A) T(p_bg) + sum_i f_i T(p_i)``
+
+    with ``T = identity`` for the linear rule and ``T = 1/x`` for the harmonic
+    one, ``A = sum_i f_i`` the accumulated coverage and ``f_i`` the fill
+    fraction of each assigned phase.  Because the background enters exactly
+    once, weighted by the fraction of the cell nothing has claimed, a cell that
+    two phases fill completely contains no background at all and the answer does
+    not depend on the order of the two :meth:`MaterialMap.assign` calls.  The
+    naive alternative --- blending each new phase against the running cell value
+    --- leaves ``(1-f_A)(1-f_B)`` of background behind and can land *outside* the
+    Wiener bounds, which is worse than not mixing at all.
+
+    When ``fill`` exceeds the unclaimed remainder ``1 - A`` the incoming phase
+    displaces the phases already present, scaled down proportionally so the
+    fractions still sum to one.  ``fill == 1`` is the limiting case and
+    overwrites the cell outright, which is the documented behaviour of a boolean
+    mask.
+    """
+    free = np.clip(1.0 - cov, 0.0, 1.0)
+    over = fill > free
+    # `over` implies cov > 0 (fill <= 1 = free + cov), so the divisor is safe;
+    # the np.where only keeps NumPy from evaluating 0/0 in the untaken branch.
+    scale = np.where(over, (1.0 - fill) / np.where(cov > 0.0, cov, 1.0), 1.0)
+    free_new = np.where(over, 0.0, free - fill)
+
+    if rule in _LINEAR:
+        assigned = prop - free * bg          # sum_i f_i p_i carried so far
+        return free_new * bg + scale * assigned + fill * float(new)
+    if rule in _HARMONIC:
+        if bg <= 0.0 or float(new) <= 0.0 or np.any(prop <= 0.0):
+            raise ValueError(
+                f"harmonic mixing of {what} needs strictly positive values "
+                "everywhere (a zero-valued phase drives the harmonic mean to "
+                "zero, which would disconnect the mesh); use the linear rule "
+                "for conductivity, or give the background a small nonzero "
+                f"{what}")
+        assigned = 1.0 / prop - free / bg
+        return 1.0 / (free_new / bg + scale * assigned + fill / float(new))
     raise ValueError(f"unknown mixing rule {rule!r}, expected 'linear' or 'harmonic'")
 
 
@@ -946,6 +1043,10 @@ class MaterialMap:
     -----
     Tagged **A3** (real scalar properties per cell) and **A2** (sub-cell
     effective-medium mixing of fill fractions).
+
+    Partial fills accumulate: the map remembers how much of each cell has been
+    claimed, so two half-filled phases leave no background behind and give the
+    same answer in either order.  See :meth:`assign` and :meth:`coverage`.
     """
 
     def __init__(self, grid: RectilinearGrid,
@@ -962,6 +1063,17 @@ class MaterialMap:
         self._ids = np.zeros(shape, dtype=np.int32)
         self._materials: list[Material] = [bg]
         self._index: dict[str, int] = {bg.name: 0}
+        # Fraction of each cell claimed by assigned phases.  The background
+        # occupies exactly the remainder, which is what keeps a multi-phase cell
+        # free of phantom background and independent of assignment order.
+        self._cov = np.zeros(shape, dtype=float)
+        # Which effective-medium rule each partially filled cell was blended
+        # with, per property (0 none, 1 linear, 2 harmonic).  Accumulating one
+        # cell under both rules is meaningless -- the linear and harmonic
+        # accumulators live in different domains and combining them can drive a
+        # permittivity negative -- so it is rejected rather than averaged.
+        self._rule: dict[str, np.ndarray] = {
+            k: np.zeros(shape, dtype=np.uint8) for k in ("eps", "sigma", "mu")}
 
     # -- introspection -----------------------------------------------------
     @property

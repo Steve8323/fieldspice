@@ -286,15 +286,49 @@ def _require_absolute_eps(a: np.ndarray, name: str) -> np.ndarray:
 
 
 def _require_absolute_mu(a: np.ndarray, name: str) -> np.ndarray:
-    """Reject a relative permeability passed where an absolute one is required."""
+    """Reject a relative permeability passed where an absolute one is required.
+
+    Unlike permittivity the two ranges overlap, so the test needs two separate
+    arguments.  ``mu_r >= 1`` by definition, while an absolute permeability runs
+    upwards from ``mu0 = 1.257e-6 H/m``; a lone value of 5 could therefore mean
+    ``mu_r = 5`` or ``mu = 5 H/m``.  What breaks the tie:
+
+    * ``mu > 10 H/m`` is ``mu_r > 8e6``, above any real material, so it is a
+      unit error whatever else is in the array;
+    * ``mu >= 1 H/m`` in **every** cell means ``mu_r >= 8e5`` everywhere, i.e. a
+      domain made entirely of mu-metal with no air, no dielectric and no
+      conductor anywhere in it.  No meshed problem looks like that, whereas an
+      array of relative permeabilities in ``[1, 10]`` (mu_r = 1 for everything
+      non-magnetic, 2 for a weakly magnetic layer) is an everyday mistake.
+
+    Without the second test the interval ``1 < mu_r <= 10`` passed through
+    silently and every wavelength and skin depth downstream came out wrong by
+    ``1 / sqrt(mu0) = 892``.  The residual blind spot is a domain that is
+    uniformly supermalloy; pass ``mu_r * units.mu0`` as documented and it is
+    unreachable.
+    """
     if np.any(a <= 0.0):
         raise ValueError(f"{name} must be strictly positive [H/m]")
-    if float(a.max()) > 10.0 or np.allclose(a, 1.0):
+    lo, hi = float(a.min()), float(a.max())
+    if hi > 10.0 or lo >= 1.0 or np.allclose(a, 1.0):
         raise ValueError(
-            f"{name} has values around {float(a.max()):.4g}, which is not a "
-            f"permeability in H/m. fieldspice is strict SI: pass the ABSOLUTE "
-            f"permeability, i.e. mu_r * units.mu0 (mu0 = {mu0:.4g} H/m).")
+            f"{name} spans {lo:.4g} to {hi:.4g}, which is a RELATIVE "
+            f"permeability, not a permeability in H/m (that would be "
+            f"mu_r from {lo / mu0:.4g} to {hi / mu0:.4g}). fieldspice is strict "
+            f"SI: pass the ABSOLUTE permeability, i.e. mu_r * units.mu0 "
+            f"(mu0 = {mu0:.4g} H/m).")
     return a
+
+
+def _require_positive(value: float, name: str, unit: str) -> float:
+    """Coerce to a strictly positive finite float, raising ``ValueError`` if not."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive {unit}, got {value!r}") from exc
+    if not np.isfinite(v) or v <= 0.0:
+        raise ValueError(f"{name} must be a positive {unit}, got {value}")
+    return v
 
 
 def _resolved(grid: RectilinearGrid) -> list[int]:
@@ -312,39 +346,115 @@ def _widths(grid: RectilinearGrid) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return (grid.hx, grid.hy, grid.hz)
 
 
-def _cell_max_width(grid: RectilinearGrid) -> np.ndarray:
-    """Largest resolved cell dimension, per cell, shape ``(Nx, Ny, Nz)`` [m].
+def _widths_by_axis(grid: RectilinearGrid, kind: str = "cell"
+                    ) -> dict[str, np.ndarray]:
+    """Cell width along each *resolved* axis, broadcast over cells or nodes [m].
 
-    Skin depth and Debye length are lengths measured *normal to a surface*, and
-    the solver does not know where that surface is, so every such check uses the
-    largest dimension of the cell.  That is the conservative choice: it can warn
-    about a cell that is in fact fine enough in the direction that matters, but
-    it never stays silent about one that is not.
+    Returns ``{"x": arr, ...}`` with each array shaped ``grid.shape_cells``
+    (``kind="cell"``) or ``grid.shape_nodes`` (``kind="node"``); a node takes the
+    larger of the two cells touching it, since the profile has to be resolved on
+    both sides of it.
+
+    Keeping the axes separate rather than collapsing them immediately to a
+    single "cell size" is what lets the skin-depth and Debye checks distinguish
+    a mesh that is coarse in a direction where nothing happens (along a
+    transmission line) from one that is coarse across a surface, which is the
+    only direction those two lengths are measured in.  Collapsed directions are
+    omitted: their nominal 1 m thickness is a normalisation, not a size.
     """
-    h = _widths(grid)
-    dims = _resolved(grid)
+    if kind not in ("cell", "node"):
+        raise ValueError(f"kind must be 'cell' or 'node', got {kind!r}")
+    shape = grid.shape_cells if kind == "cell" else grid.shape_nodes
+    out: dict[str, np.ndarray] = {}
+    for d in _resolved(grid):
+        h = _widths(grid)[d]
+        if kind == "node":
+            h = np.maximum(np.concatenate([h[:1], h]), np.concatenate([h, h[-1:]]))
+        shp = [1, 1, 1]
+        shp[d] = -1
+        out["xyz"[d]] = np.ascontiguousarray(
+            np.broadcast_to(h.reshape(shp), shape))
+    return out
+
+
+def _surface_normal_widths(grid: RectilinearGrid, cond: np.ndarray
+                           ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """Cell widths in the directions in which a conductor actually has a surface.
+
+    The skin effect is an exponential decay measured *normal to a conductor
+    surface*, so the mesh only has to resolve ``delta`` along axes in which the
+    conductor is bounded.  A line of cells that conducts from one domain wall to
+    the other has no surface with that normal inside the domain --- with the
+    default homogeneous Neumann wall the conductor simply continues through it
+    --- so the cell size along that line cannot affect the skin profile.  A line
+    that is *not* conducting end to end contains only bounded runs of conductor,
+    so every conducting cell on it does face a surface with that normal.  Those
+    two statements are exhaustive, which is what makes the test exact rather
+    than heuristic.
+
+    This replaces an earlier rule that used the largest cell dimension outright.
+    That rule called a transmission line meshed coarsely along its length and
+    finely across it a hard error, which is a false statement about a mesh that
+    is already far finer than required in every direction the current profile
+    actually varies in.
+
+    Parameters
+    ----------
+    grid
+        The grid.
+    cond
+        Boolean ``(Nx, Ny, Nz)`` mask of conducting cells.
+
+    Returns
+    -------
+    width
+        Largest cell dimension among the surface-normal axes, per cell [m];
+        zero where the conductor has no surface at all.
+    has_surface
+        ``True`` in conducting cells with at least one surface-normal axis.
+    per_axis
+        ``{axis_name: width}`` with ``inf`` where that axis is not a surface
+        normal, so ``delta / width`` is directly a cells-per-delta count.
+    """
     shape = grid.shape_cells
-    out = np.zeros(shape)
-    for d in dims:
-        shp = [1, 1, 1]
-        shp[d] = -1
-        out = np.maximum(out, np.broadcast_to(h[d].reshape(shp), shape))
-    return out
+    width = np.zeros(shape)
+    has_surface = np.zeros(shape, dtype=bool)
+    per_axis: dict[str, np.ndarray] = {}
+    for name, hd in _widths_by_axis(grid, "cell").items():
+        d = "xyz".index(name)
+        through = np.all(cond, axis=d, keepdims=True)
+        rel = cond & ~through
+        per_axis[name] = np.where(rel, hd, np.inf)
+        width = np.where(rel, np.maximum(width, hd), width)
+        has_surface |= rel
+    return width, has_surface, per_axis
 
 
-def _node_max_width(grid: RectilinearGrid) -> np.ndarray:
-    """Largest resolved cell width adjacent to each node, shape ``shape_nodes`` [m]."""
+def _max_cell_aspect_ratio(grid: RectilinearGrid) -> tuple[float, str, str]:
+    """Largest ratio between two dimensions of a *single* cell, and the two axes.
+
+    On a tensor-product grid the axes are independent, so the worst cell is the
+    one that takes the widest cell of one axis and the narrowest of another; the
+    maximum is therefore ``max(h[d]) / min(h[e])`` over ordered pairs of
+    distinct resolved axes.  ``grid.max_aspect_ratio()`` reports
+    ``max(h) / min(h)`` over *all* resolved axes at once, which also admits
+    ``d == e`` and so measures the grading range of the mesh rather than the
+    shape of any cell in it; on a graded axis it can exceed every real cell
+    aspect ratio.  The frozen grid method is reported separately.
+    """
     dims = _resolved(grid)
-    shape = grid.shape_nodes
-    out = np.zeros(shape)
-    for d, h in enumerate(_widths(grid)):
-        if d not in dims:
-            continue
-        hn = np.maximum(np.concatenate([h[:1], h]), np.concatenate([h, h[-1:]]))
-        shp = [1, 1, 1]
-        shp[d] = -1
-        out = np.maximum(out, np.broadcast_to(hn.reshape(shp), shape))
-    return out
+    if len(dims) < 2:
+        return 1.0, "", ""
+    h = _widths(grid)
+    best, wide, thin = 1.0, "", ""
+    for d in dims:
+        for e in dims:
+            if d == e:
+                continue
+            r = float(h[d].max()) / float(h[e].min())
+            if r > best:
+                best, wide, thin = r, "xyz"[d], "xyz"[e]
+    return best, wide, thin
 
 
 def _locate(flat: int, shape: tuple[int, ...], grid: RectilinearGrid | None,
@@ -431,16 +541,11 @@ def check_quasistatic(grid: RectilinearGrid,
 
     if t_rise is None and freq is None:
         raise ValueError("check_quasistatic needs t_rise [s] or freq [Hz]")
-    f_from_rise = None
-    if t_rise is not None:
-        if not np.isfinite(t_rise) or t_rise <= 0.0:
-            raise ValueError(f"t_rise must be a positive time in seconds, got {t_rise}")
-        f_from_rise = 0.35 / float(t_rise)
-    if freq is not None:
-        if not np.isfinite(freq) or freq <= 0.0:
-            raise ValueError(f"freq must be a positive frequency in Hz, got {freq}")
-    f = max([v for v in (f_from_rise, freq if freq is None else float(freq))
-             if v is not None])
+    f_from_rise = (None if t_rise is None
+                   else 0.35 / _require_positive(t_rise, "t_rise", "time in seconds"))
+    f_direct = (None if freq is None
+                else _require_positive(freq, "freq", "frequency in Hz"))
+    f = max(v for v in (f_from_rise, f_direct) if v is not None)
 
     eps_r = eps / eps0
     mu_r = mu / mu0
@@ -549,17 +654,26 @@ def check_skin_depth(grid: RectilinearGrid,
     Report
         ``details`` carries ``delta_min_m``, ``delta_max_m``, the number of
         conducting and under-resolved cells, the worst
-        ``cells_per_skin_depth``, the worst cell's index and position, and the
-        cell size that would fix it.
+        ``cells_per_skin_depth``, ``cells_per_skin_depth_by_axis``, the worst
+        cell's index and position, and the cell size that would fix it.
 
     Notes
     -----
+    Two escapes keep the criterion from firing where it is vacuous.
+
     A conductor thinner than its own skin depth carries an essentially uniform
-    current, so the criterion is vacuous there.  This check therefore compares
-    ``delta`` against the bounding-box size of the conducting region first and
-    reports ``ok`` when the skin depth exceeds it.  With several disjoint
-    conductors the bounding box is larger than any one of them, which makes the
-    escape harder to trigger --- conservative in the safe direction.
+    current, so the check compares ``delta`` against the bounding-box size of
+    the conducting region first and reports ``ok`` when the skin depth exceeds
+    it.  With several disjoint conductors the bounding box is larger than any
+    one of them, which makes the escape harder to trigger --- conservative in
+    the safe direction.
+
+    The cell size compared against ``delta`` is the largest cell dimension among
+    the axes in which the conductor is *bounded*, not the largest dimension
+    outright: see :func:`_surface_normal_widths`.  A direction in which the
+    conductor runs from wall to wall has no surface inside the domain and no
+    skin profile to resolve, which is the usual situation along a transmission
+    line.
 
     In full-wave runs the alternative to meshing through ``delta`` is the
     surface-impedance boundary condition (A4b), which is valid in exactly the
@@ -572,8 +686,7 @@ def check_skin_depth(grid: RectilinearGrid,
         mu = np.full(grid.shape_cells, mu0)
     else:
         mu = _require_absolute_mu(_as_cell_array(mu_cell, grid, "mu_cell"), "mu_cell")
-    if not np.isfinite(freq) or freq <= 0.0:
-        raise ValueError(f"freq must be a positive frequency in Hz, got {freq}")
+    freq = _require_positive(freq, "freq", "frequency in Hz")
 
     omega = 2.0 * np.pi * float(freq)
     cond = sigma > 0.0
@@ -602,13 +715,39 @@ def check_skin_depth(grid: RectilinearGrid,
         span = max(span, float(nodes[idx[-1] + 1] - nodes[idx[0]]))
     det["conductor_span_m"] = span
 
-    h = _cell_max_width(grid)
+    h, has_surface, per_axis = _surface_normal_widths(grid, cond)
+    checked = cond & has_surface
+    by_axis: dict[str, float] = {}
+    for name, w in per_axis.items():
+        sel = checked & np.isfinite(w)
+        if sel.any():
+            by_axis[name] = float(np.min(delta[sel] / w[sel]))
+    det["cells_per_skin_depth_by_axis"] = by_axis
+    det["surface_normal_axes"] = sorted(by_axis)
+    det["n_cells_with_a_surface"] = int(checked.sum())
+
+    if not checked.any():
+        det["n_under_resolved"] = 0
+        return Report(
+            "check_skin_depth", "ok",
+            f"The conducting region runs from wall to wall in every resolved "
+            f"direction, so it has no surface inside the domain: with the "
+            f"default homogeneous Neumann walls it is an infinite slab and "
+            f"there is no skin profile to resolve. delta is "
+            f"{det['delta_min_m']:.4g} to {det['delta_max_m']:.4g} m at "
+            f"{freq:.4g} Hz. If a wall was meant to be an open end rather than "
+            f"a symmetry plane, extend the domain past the conductor so its "
+            f"surface is inside it.", det, "A4a")
+
     res = np.full(grid.shape_cells, np.inf)
-    res[cond] = delta[cond] / h[cond]
-    worst = int(np.argmin(np.where(cond, res, np.inf)))
+    res[checked] = delta[checked] / h[checked]
+    worst = int(np.argmin(np.where(checked, res, np.inf)))
     worst_res = float(res.flat[worst])
+    worst_axis = next((name for name, w in per_axis.items()
+                       if w.flat[worst] == h.flat[worst]), "")
     det["min_cells_per_skin_depth"] = worst_res
     det["worst_cell_size_m"] = float(h.flat[worst])
+    det["worst_normal_axis"] = worst_axis
     det["worst_delta_m"] = float(delta.flat[worst])
     det["required_cell_size_m"] = float(delta.flat[worst] / SKIN_CELLS_PER_DELTA)
     det["n_under_resolved"] = int(np.count_nonzero(res < SKIN_CELLS_PER_DELTA))
@@ -624,30 +763,39 @@ def check_skin_depth(grid: RectilinearGrid,
             f"{worst_res:.4g} cells per skin depth, which does not matter here.",
             det, "A4a")
 
-    frac = 100.0 * det["n_under_resolved"] / n_cond
+    n_checked = det["n_cells_with_a_surface"]
+    frac = 100.0 * det["n_under_resolved"] / n_checked
     where = _loc_str(det)
+    axes = ", ".join(f"{k} {v:.4g}" for k, v in sorted(by_axis.items()))
+    skipped_axes = [name for name in _widths_by_axis(grid) if name not in by_axis]
+    axis_note = (f" Cells per delta by direction: {axes}."
+                 + (f" Direction(s) {', '.join(skipped_axes)} carry no conductor "
+                    f"surface (the conductor spans the domain there), so the cell "
+                    f"size along them cannot affect the current profile and is "
+                    f"not counted." if skipped_axes else ""))
     if worst_res >= SKIN_CELLS_PER_DELTA:
         level = "ok"
         msg = (f"Every conducting cell resolves the skin depth: the worst is "
                f"{worst_res:.4g} cells per delta (target "
                f"{SKIN_CELLS_PER_DELTA:g}), with delta between "
                f"{det['delta_min_m']:.4g} and {det['delta_max_m']:.4g} m at "
-               f"{freq:.4g} Hz.")
+               f"{freq:.4g} Hz.{axis_note}")
     else:
         level = "warn" if worst_res >= 1.0 else "error"
         sev = ("the current profile is not represented at all"
                if level == "error" else "the AC resistance will come out low")
-        msg = (f"{det['n_under_resolved']} of {n_cond} conducting cells "
-               f"({frac:.1f}%) are coarser than delta/{SKIN_CELLS_PER_DELTA:g}, "
-               f"so {sev}. Worst: {where} has h = "
-               f"{det['worst_cell_size_m']:.4g} m against delta = "
+        msg = (f"{det['n_under_resolved']} of {n_checked} conducting cells with "
+               f"a surface ({frac:.1f}%) are coarser than "
+               f"delta/{SKIN_CELLS_PER_DELTA:g}, so {sev}. Worst: {where} has "
+               f"h = {det['worst_cell_size_m']:.4g} m along "
+               f"{det['worst_normal_axis'] or '?'} against delta = "
                f"{det['worst_delta_m']:.4g} m, i.e. {worst_res:.4g} cells per "
                f"skin depth. Refine that region to "
                f"{det['required_cell_size_m']:.4g} m or finer (use "
                f"grid.auto_mesh_1d with the conductor surfaces as features), "
                f"lower the analysis frequency, or --- in fdtd --- switch the "
                f"conductor to the surface-impedance treatment of A4b instead of "
-               f"meshing through it.")
+               f"meshing through it.{axis_note}")
     return Report("check_skin_depth", level, msg, det, "A4a")
 
 
@@ -664,11 +812,18 @@ def check_mesh_quality(grid: RectilinearGrid) -> Report:
       along an axis.  Above ``GROWTH_WARN`` (1.5) the convergence order is
       measurably degraded, above ``GROWTH_ERROR`` (2.0) the discretisation is
       no longer trustworthy in that region.
-    * **aspect ratio** --- the largest ratio between the dimensions of a single
-      cell.  A tensor-product grid has no element-quality failure mode (A2), so
-      a large aspect ratio costs conditioning rather than accuracy; it is
-      reported and warned about only at ``ASPECT_WARN`` (1e3), where an
-      iterative solver starts to struggle.
+    * **aspect ratio** --- the largest ratio between two dimensions of a single
+      cell, ``max(h[d]) / min(h[e])`` over distinct resolved axes.  A
+      tensor-product grid has no element-quality failure mode (A2), so a large
+      aspect ratio costs conditioning rather than accuracy; it is reported and
+      warned about only at ``ASPECT_WARN`` (1e3), where an iterative solver
+      starts to struggle.
+
+    ``grid.max_aspect_ratio()`` is *not* used for that verdict and is reported
+    separately as ``size_range``: it takes ``max(h) / min(h)`` over all resolved
+    axes at once, which also admits both ends coming from the same graded axis,
+    so on a graded mesh it exceeds the aspect ratio of every cell actually
+    present and would raise the report to ``warn`` on a quantity no cell attains.
 
     Parameters
     ----------
@@ -680,11 +835,12 @@ def check_mesh_quality(grid: RectilinearGrid) -> Report:
     -------
     Report
         ``details`` carries ``max_growth_ratio``, the axis and index where it
-        occurs and the coordinate there, ``max_aspect_ratio``, the smallest and
-        largest cell, and the cell counts.
+        occurs and the coordinate there, ``max_aspect_ratio`` with the pair of
+        axes that produces it, ``size_range``, the smallest and largest cell,
+        and the cell counts.
     """
     growth = grid.max_growth_ratio()
-    aspect = grid.max_aspect_ratio()
+    aspect, wide_axis, thin_axis = _max_cell_aspect_ratio(grid)
 
     worst_axis, worst_i, worst_val = "x", 0, 1.0
     for name, h in zip("xyz", _widths(grid)):
