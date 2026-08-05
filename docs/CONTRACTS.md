@@ -90,6 +90,15 @@ Flattening is always C-order `.ravel()`. Use `split_edge_vector` /
 dimensionality; the operators already handle it. Collapsed directions have a
 finite thickness (default 1 m) so results are per-unit-length.
 
+> **Gotcha, read this twice.** A collapsed direction still has `N+1 = 2` node
+> planes. A "1D" grid with 136 cells has node shape `(137, 2, 2)` and
+> `n_nodes = 548`, **not** 137. Never index a flat node vector as if it were
+> 1D. Build nodal quantities with `grid.node_coords()` (which returns properly
+> broadcast `(Nx+1, Ny+1, Nz+1)` arrays) and `.ravel()` them, and select
+> electrodes with `np.arange(n_nodes).reshape(grid.shape_nodes)[0].ravel()`.
+> The solution is uniform across collapsed directions — assert that in your
+> tests, it is a good correctness check.
+
 ## Module assignments and required public API
 
 Each module below is owned by exactly one implementer. Create only your file.
@@ -438,18 +447,53 @@ criteria, not suggestions):
 | parallel-plate C | `eps*A/d` | 1e-6 rel |
 | coaxial C, L | `2*pi*eps/ln(b/a)`, `mu*ln(b/a)/(2*pi)` | 1% |
 | slab resistance | `L/(sigma*A)` | 1e-6 rel |
-| RC step response | `1 - exp(-t/RC)` | 1e-3 |
+| RC step response | see **verified** note below | 1e-3 |
 | RLC ring-down | damped sinusoid | 1% |
 | skin depth | `sqrt(2/(omega*mu*sigma))` | 3% |
 | microstrip Z0 | Hammerstad–Jensen | 5% |
 | FDTD plane wave | phase velocity `c0`, numerical dispersion | 1% |
-| pn junction | depletion width, built-in potential | 2% |
+| pn junction built-in potential | `Vt*ln(Na*Nd/ni^2)` | **1e-9 rel** |
+| pn depletion width | `sqrt(2 eps Vbi (Na+Nd)/(q Na Nd))` | **25%, see note** |
+| pn depletion scaling | `W(Vr) ∝ sqrt(Vbi+Vr)` for `Vr >> Vt` | 2% |
 | MOSFET subthreshold | 60 mV/decade at 300 K | 3% |
 | diode | Shockley ideality n≈1 | 5% |
 | EQS vs FDTD | agree when `L/lambda < 0.01` | 2% |
 
 The last row is the most important test in the project: it is the only
 direct evidence that the quasi-static approximation is doing what we claim.
+
+### Verified reference numbers (measured on the frozen core, trust these)
+
+These were computed with the frozen `grid.py` / `operators.py` and are known
+good. If your module disagrees with one, your module is wrong.
+
+**Electrostatics / EQS.** Parallel plate (d=2 um, 5x4 um, eps_r=3.9) gives
+C to 1.5e-14 relative error; a uniform slab gives R to 3.4e-14. A series
+R–C stack (left half sigma=1e3, eps_r=4; right half insulating, eps_r=2)
+steps from the **capacitive-divider** value `eps1/(eps1+eps2) = 2/3` at
+`t=0+` and relaxes to 1.0 with `tau = R1*(C1+C2)`. Backward Euler error is
+first order: 1.22e-3 → 6.11e-4 → 3.06e-4 as dt halves. Note the correct
+initial condition is the **electrostatic** solve (`L_eps psi = Q`), not
+zero; starting from zero is a physically wrong initial condition and is a
+common bug.
+
+**pn junction (Si, Na=Nd=1e17 cm^-3, 300 K).** `Vbi = 0.833370 V` and the
+nonlinear Poisson Newton reproduces it to **6.7e-16 relative** in 10
+iterations on a 0.5 nm-graded mesh. Net charge integrates to 1.2e-16 C.
+
+**Do not chase a tight tolerance on depletion width.** The analytic `W`
+above is the *depletion approximation*, which assumes abrupt space-charge
+edges. The true solution has exponential tails of order the Debye length
+`LD = sqrt(eps*Vt/(q*N))` (12.9 nm in the case above), so a
+10%-of-peak-charge measurement gives 179 nm against an analytic 147 nm — a
+22% discrepancy that is **correct physics, not error**, and does not shrink
+under mesh refinement. Test `Vbi` (exact) and the reverse-bias *scaling*
+(asymptotically exact); treat absolute `W` as a sanity check only.
+
+**Newton damping.** Clamp the potential update to a few `kT/q` per
+iteration (`lam = min(1, 3*Vt/max|dpsi|)`); without it the exponential
+`exp(psi/Vt)` overflows on the first step from a poor initial guess.
+Clip the exponent argument to about +-400 before calling `np.exp`.
 
 ## Style
 
