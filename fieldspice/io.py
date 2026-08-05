@@ -51,7 +51,7 @@ import json
 import os
 import warnings
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -77,6 +77,9 @@ _NPZ_SUFFIXES = frozenset({".npz"})
 
 _META_KEY = "__meta__"
 _FORMAT_KEY = "__format__"
+
+# Stand-in for an empty field/terminal name; see _esc.
+_EMPTY_NAME = "%."
 
 # Numeric kinds that both backends can store without an encoder.
 _NUMERIC_KINDS = frozenset("biufc")
@@ -133,9 +136,15 @@ def _esc(name: str) -> str:
     Field, scalar and terminal names are user data and may contain ``/``,
     which would silently create a nested HDF5 group and a nested zip path.
     Escaping keeps the stored key a single, unambiguous component.
+
+    The empty name gets its own token because HDF5 rejects an empty path
+    component outright, and ``_esc`` never otherwise emits ``%`` followed by a
+    non-hex character, so the token cannot collide with a real escape.
     """
     if not isinstance(name, str):
         raise ValueError(f"names must be str, got {type(name).__name__}")
+    if name == "":
+        return _EMPTY_NAME
     out = []
     for ch in name:
         if ch.isalnum() and ch.isascii() or ch in "._-":
@@ -147,6 +156,8 @@ def _esc(name: str) -> str:
 
 def _unesc(name: str) -> str:
     """Inverse of :func:`_esc`."""
+    if name == _EMPTY_NAME:
+        return ""
     raw = bytearray()
     i = 0
     n = len(name)

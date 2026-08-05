@@ -904,24 +904,36 @@ def voxelize(grid: RectilinearGrid, shape: Shape, subsample: int = 2,
 
     **Accuracy.**  The estimator is a midpoint quadrature of the indicator
     function.  Cells entirely inside or outside are exact; only cells cut by
-    the surface carry error, and each cut cell's error falls like
-    ``O(1/subsample)`` while the number of cut cells is fixed.  Total volume
-    error therefore converges as ``O(1/subsample)`` at fixed grid, and the cost
-    grows as ``subsample**3``: ``subsample=2`` (8 points) is the sensible
+    the surface carry error.  For a cut perpendicular to a grid axis the
+    computed fraction is exactly ``round(s*f)/s``, so the per-cell error is
+    bounded by ``1/(2*subsample)`` and that bound is attained --- first order,
+    and it is the worst case.  For a surface tilted or curved with respect to
+    the grid the sub-cell errors within one cell equidistribute and largely
+    cancel, and the measured rate is closer to ``O(1/subsample**2)``.  Cost
+    grows as ``subsample**3``, so ``subsample=2`` (8 points) is the sensible
     default, 3 or 4 for a curved surface that matters, above 6 almost never
     pays for itself compared with refining the grid.
+
+    The *total* volume of a shape converges faster still and non-monotonically,
+    because over- and under-counted cells cancel across the surface.  Do not
+    use a volume check to tune ``subsample``; it flatters the result.
 
     **Memory.**  Coordinates are built once per chunk with
     ``np.meshgrid(..., indexing="ij", sparse=True)``, so the three coordinate
     arrays are 1-D and cost nothing; the full-size temporaries are those created
     inside ``contains``.  The domain is chunked along the slowest axis (x, and
-    then y if a single x-slab is still too large) so that no more than
-    ``chunk_points`` sample points are live at once.  Peak usage is roughly
-    ``chunk_points * (8 bytes per float64 temporary + 1 byte per bool)`` times
-    the depth of the CSG tree: about 40 MB for a primitive at the default, and
-    a few hundred MB for a deep tree.  A ``200**3`` grid at ``subsample=4`` is
-    5.1e8 sample points, which would be 512 MB as a single bool array; chunked,
-    it never exceeds the budget above.
+    then y if a single x-slab is still over budget) so that no more than
+    ``chunk_points`` sample points are live at once.  The transient working set
+    is then roughly ``chunk_points`` times (8 bytes per live float64 temporary
+    plus 1 byte per live bool), on top of the ``8 * n_cells`` byte result.
+    Measured on a ``200**3`` grid at ``subsample=4`` --- 5.1e8 sample points ---
+    with a three-node CSG tree: 158 MB of peak growth at the default
+    ``chunk_points``, of which 61 MB is the result array itself, against 4.9 GB
+    with chunking disabled.
+
+    z is deliberately never chunked, because splitting the fastest axis would
+    break the contiguity of the sub-cell reduction; a grid whose z extent alone
+    exceeds the budget (``subsample**3 * Nz`` points) will overshoot it.
 
     Examples
     --------

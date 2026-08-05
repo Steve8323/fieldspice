@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fieldspice"
+version = "0.1.0"
+description = "First-principles electromagnetic field simulation for analog and digital circuits"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Steven Hou" }]
+keywords = [
+    "electromagnetics", "fdtd", "quasistatic", "circuit-simulation",
+    "drift-diffusion", "tcad", "parasitic-extraction", "signal-integrity",
+    "finite-integration", "yee-grid", "spice",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+dependencies = [
+    "numpy>=1.23",
+    "scipy>=1.9",
+]
+
+[project.optional-dependencies]
+# Everything here is genuinely optional: the package imports and runs without
+# any of it. Accelerators are imported lazily inside try/except.
+viz = ["matplotlib>=3.6"]
+io = ["h5py>=3.7"]
+fast = ["pyamg>=4.2", "numba>=0.57"]
+test = ["pytest>=7.0", "pytest-xdist"]
+all = [
+    "matplotlib>=3.6", "h5py>=3.7", "pyamg>=4.2", "numba>=0.57",
+    "pytest>=7.0", "pytest-xdist",
+]
+
+[project.urls]
+Homepage = "https://github.com/Steve8323/fieldspice"
+Documentation = "https://github.com/Steve8323/fieldspice/tree/main/docs"
+Issues = "https://github.com/Steve8323/fieldspice/issues"
+
+[tool.setuptools.packages.find]
+include = ["fieldspice*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "slow: tests that take more than a few seconds",
+    "physics: quantitative validation against a closed-form reference",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E741"]  # ambiguous names: i, j, k and l are grid indices here

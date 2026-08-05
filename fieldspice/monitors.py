@@ -136,12 +136,29 @@ __all__ = [
     "MonitorSet",
 ]
 
-_AXIS_NAMES = {"x": 0, "y": 1, "z": 2, 0: 0, 1: 1, 2: 2}
-
-
 # ==========================================================================
 # Errors and small state helpers
 # ==========================================================================
+def _axis_index(axis: str | int) -> int:
+    """Map ``"x"``/``"y"``/``"z"`` or ``0``/``1``/``2`` to an axis number.
+
+    A function rather than a module-level lookup dict because
+    ``docs/CONTRACTS.md`` rules out module-level mutable state, and a dict is
+    mutable however constant it looks.
+    """
+    if isinstance(axis, str):
+        idx = {"x": 0, "y": 1, "z": 2}.get(axis.lower(), -1)
+    elif isinstance(axis, (int, np.integer)) and not isinstance(axis, bool):
+        idx = int(axis) if 0 <= int(axis) <= 2 else -1
+    else:
+        idx = -1
+    if idx < 0:
+        raise ValueError(
+            f"axis must be one of 'x', 'y', 'z', 0, 1, 2; got {axis!r}")
+    return idx
+
+
+
 class MonitorStateError(ValueError):
     """The solver state lacks something a monitor needs.
 
@@ -671,7 +688,8 @@ class TerminalProbe(Monitor):
         self._phi_prev: np.ndarray | None = None
         self._t_prev: float | None = None
 
-    def _resolve(self, state: Mapping[str, Any], who: str) -> None:
+    def _resolve(self, state: Mapping[str, Any],
+                 who: str) -> tuple[Terminal, np.ndarray, bool]:
         if self._terminal is None:
             self._terminal = _find_terminal(state, self.terminal_name, who)
         if self._nodes is None:
@@ -686,31 +704,38 @@ class TerminalProbe(Monitor):
             if self._disp:
                 _require(state, "eps_edge", who,
                          "the displacement current term eps dphi/dt")
+        return self._terminal, self._nodes, self._disp
 
     def _record(self, state: Mapping[str, Any], t: float) -> None:
         who = repr(self)
         grid = self._cache.grid(state, who)
-        self._resolve(state, who)
-        assert self._nodes is not None and self._terminal is not None
+        term, nodes, want_disp = self._resolve(state, who)
+
+        phi: np.ndarray | None = None
+        if _present(state, "phi"):
+            phi = _flat(state["phi"], grid.n_nodes, who, "phi")
 
         # -- voltage -------------------------------------------------------
         v: float | None = None
         tv = state.get("terminal_voltage")
-        if self.voltage_from in ("auto",) and isinstance(tv, Mapping) \
+        if self.voltage_from == "auto" and isinstance(tv, Mapping) \
                 and self.terminal_name in tv:
             v = float(tv[self.terminal_name])
-        if v is None and self.voltage_from in ("auto", "phi") \
-                and _present(state, "phi"):
-            phi = _flat(state["phi"], grid.n_nodes, who, "phi")
-            v = float(np.mean(phi[self._nodes]))
+        if v is None and self.voltage_from in ("auto", "phi"):
+            if phi is None and self.voltage_from == "phi":
+                _require(state, "phi", who, "voltage_from='phi'")
+            if phi is not None:
+                v = float(np.mean(phi[nodes]))
         if v is None:
-            declared = self._terminal.value_at(t)
-            if declared is None or getattr(self._terminal, "driven", "") \
-                    == "current":
+            declared = (None if getattr(term, "driven", "") == "current"
+                        else term.value_at(t))
+            if declared is None:
                 if self.voltage_from == "declared":
                     raise MonitorStateError(
                         f"{who}: voltage_from='declared' but terminal "
                         f"{self.terminal_name!r} is not voltage-driven")
+                # A floating or current-driven electrode has no knowable
+                # potential without the field; NaN says so instead of lying.
                 v = float("nan")
             else:
                 v = float(declared)
@@ -719,48 +744,49 @@ class TerminalProbe(Monitor):
         # -- current -------------------------------------------------------
         ti = state.get("terminal_current")
         if isinstance(ti, Mapping) and self.terminal_name in ti:
-            i_total = float(ti[self.terminal_name])
-            self._emit("i", i_total)
-            if self._disp:
+            self._emit("i", float(ti[self.terminal_name]))
+            if want_disp:
                 # The solver's number is authoritative but unsplit; do not
                 # invent a decomposition it did not provide.
                 self._emit("i_cond", float("nan"))
                 self._emit("i_disp", float("nan"))
-            self._phi_prev = None
-            self._t_prev = t
+            self._remember(phi, t)
             return
 
-        phi = _flat(_require(state, "phi", who,
-                             "reconstructing the terminal current from the "
-                             "field needs the node potential"),
-                    grid.n_nodes, who, "phi")
+        if phi is None:
+            _require(state, "phi", who,
+                     "reconstructing the terminal current from the field "
+                     "needs the node potential")
         G = self._cache.G(state, who)
         ratio = self._cache.edge_ratio(state, who)
 
         i_cond = 0.0
         if _present(state, "sigma_edge"):
             sig = _flat(state["sigma_edge"], grid.n_edges, who, "sigma_edge")
-            i_cond = float(np.sum(
-                (G.T @ ((sig * ratio) * (G @ phi)))[self._nodes]))
-        elif not self._disp:
+            i_cond = float(np.sum((G.T @ ((sig * ratio) * (G @ phi)))[nodes]))
+        elif not want_disp:
             raise MonitorStateError(
-                f"{who}: needs state['sigma_edge'] or state['eps_edge'] to "
-                f"reconstruct a terminal current, or state['terminal_current'] "
-                f"supplied directly by the solver.")
+                f"{who} needs state['sigma_edge'] [S/m] or state['eps_edge'] "
+                f"[F/m] to reconstruct a terminal current, or "
+                f"state['terminal_current'] supplied by the solver.")
 
         i_disp = 0.0
-        if self._disp:
+        if want_disp:
             eps = _flat(state["eps_edge"], grid.n_edges, who, "eps_edge")
             dphi = self._dphidt(state, phi, t, grid, who)
             if dphi is not None:
                 i_disp = float(np.sum(
-                    (G.T @ ((eps * ratio) * (G @ dphi)))[self._nodes]))
+                    (G.T @ ((eps * ratio) * (G @ dphi)))[nodes]))
             self._emit("i_cond", i_cond)
             self._emit("i_disp", i_disp)
         self._emit("i", i_cond + i_disp)
+        self._remember(phi, t)
 
-        self._phi_prev = np.array(phi, dtype=float, copy=True)
-        self._t_prev = t
+    def _remember(self, phi: np.ndarray | None, t: float) -> None:
+        """Keep one frame of history for the backward-difference dphi/dt."""
+        if phi is not None:
+            self._phi_prev = np.array(phi, dtype=float, copy=True)
+            self._t_prev = t
 
     def _dphidt(self, state: Mapping[str, Any], phi: np.ndarray, t: float,
                 grid: RectilinearGrid, who: str) -> np.ndarray | None:
@@ -1074,7 +1100,8 @@ class FluxMonitor(Monitor):
     bounds
         Optional 3-sequence of ``(lo, hi)`` [m] or ``None`` restricting the
         transverse extent of the plane, e.g. to cut one conductor out of a
-        cross-section.  The entry for ``axis`` itself is ignored.
+        cross-section.  The entry for ``axis`` itself is ignored.  **Read the
+        note below on what a transverse bound actually selects.**
     edges
         Explicit flat edge indices into the concatenated ``[ex, ey, ez]``
         vector.  Mutually exclusive with ``axis``/``position``.
@@ -1098,6 +1125,18 @@ class FluxMonitor(Monitor):
     which is the correct "current entering the domain" surface.  An empty
     selection (bounds that miss every edge) is a :class:`ValueError`, not a
     silent zero.
+
+    ``bounds`` selects **node planes, not cells**, and each selected edge
+    carries the *dual* area straddling its node plane: half the cell below plus
+    half the cell above.  A bound of ``(0, w)`` on a uniform mesh of pitch ``h``
+    therefore integrates over a width of ``w + h/2``, not ``w``, because the
+    outermost selected node plane owns half a cell of material on its far side.
+    This is not an approximation --- it is the exact dual-area partition, and it
+    is what makes two adjacent bounds add up to the whole cross-section --- but
+    it does mean that a bound drawn on the geometric edge of a conductor
+    over-counts by half a cell.  Draw transverse bounds through the *insulator*,
+    where sigma is zero and the extra half cell contributes nothing, and the
+    result is exact.  ``n_edges_cut`` reports how many edges were selected.
     """
 
     def __init__(self, name: str, axis: str | int | None = None,
@@ -1142,11 +1181,13 @@ class FluxMonitor(Monitor):
         self._signs: np.ndarray | None = None
         self._e_prev: np.ndarray | None = None
         self._t_prev: float | None = None
+        self.n_edges_cut: int = 0
 
     # -- surface resolution -----------------------------------------------
-    def _resolve(self, state: Mapping[str, Any], who: str) -> None:
-        if self._edges is not None:
-            return
+    def _resolve(self, state: Mapping[str, Any],
+                 who: str) -> tuple[np.ndarray, np.ndarray]:
+        if self._edges is not None and self._signs is not None:
+            return self._edges, self._signs
         grid = self._cache.grid(state, who)
         if self._edge_sel is not None:
             idx = self._edge_sel
@@ -1171,10 +1212,10 @@ class FluxMonitor(Monitor):
                     f"{who}: signs has {sgn.size} entries but edges has "
                     f"{idx.size}")
             self._edges, self._signs = idx, self.sign * sgn
-            return
+            self.n_edges_cut = int(idx.size)
+            return self._edges, self._signs
 
-        d = self.axis
-        assert d is not None
+        d = int(self.axis)  # type: ignore[arg-type]
         nodes_d = (grid.xn, grid.yn, grid.zn)[d]
         ncell_d = grid.ncell[d]
         lo, hi = float(nodes_d[0]), float(nodes_d[-1])
@@ -1218,17 +1259,16 @@ class FluxMonitor(Monitor):
         self._edges = idx
         self._signs = np.full(idx.size, self.sign)
         self.n_edges_cut = int(idx.size)
+        return self._edges, self._signs
 
     # -- recording ---------------------------------------------------------
     def _record(self, state: Mapping[str, Any], t: float) -> None:
         who = repr(self)
         grid = self._cache.grid(state, who)
-        self._resolve(state, who)
-        assert self._edges is not None and self._signs is not None
+        sel, sgn = self._resolve(state, who)
 
         e = _edge_circulation(state, self._cache, who)
         ratio = self._cache.edge_ratio(state, who)
-        sel, sgn = self._edges, self._signs
 
         i_cond = 0.0
         if _present(state, "sigma_edge"):
