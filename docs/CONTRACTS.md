@@ -490,10 +490,28 @@ edges. The true solution has exponential tails of order the Debye length
 under mesh refinement. Test `Vbi` (exact) and the reverse-bias *scaling*
 (asymptotically exact); treat absolute `W` as a sanity check only.
 
-**Newton damping.** Clamp the potential update to a few `kT/q` per
-iteration (`lam = min(1, 3*Vt/max|dpsi|)`); without it the exponential
-`exp(psi/Vt)` overflows on the first step from a poor initial guess.
-Clip the exponent argument to about +-400 before calling `np.exp`.
+**Newton damping — measured, do not improvise.** Clip the exponent
+argument to about ±400 before `np.exp`, then damp in two stages:
+
+```python
+lam = min(1.0, 5*Vt/max(abs(dpsi)))        # 1. keep exp() in range
+while ||F(psi + lam*dpsi)|| >= (1 - 1e-4*lam) * ||F(psi)||:
+    lam *= 0.5                              # 2. Armijo line search
+```
+
+Measure `||F||` over the **free** nodes only (Dirichlet rows are
+identically zero and dilute the norm).
+
+A bare step clamp with no line search is **not sufficient** and is a trap
+we actually fell into: with `lam = min(1, 3*Vt/max|dpsi|)` the equilibrium
+pn solve converges in 10 iterations at `ni = 1.0e16` but enters a stable
+**limit cycle** (residual alternating 2.93e-2 / 4.82e-2 forever) at
+`ni = 9.65e15`. Nothing in a pure clamp forces the residual to decrease,
+so convergence is luck. With the line search added, the same solver takes
+**9-11 iterations** across `ni` in {9.65e15, 1e16, 1.45e16} crossed with
+`(Na, Nd)` in {(1e17,1e17), (1e15,1e18), (1e19,1e16), (5e16,3e17)} cm^-3,
+reaching `Vbi` to 1e-12 relative or better in every case. Reproduce that
+sweep in your tests.
 
 ## Style
 

@@ -319,7 +319,7 @@ def plot_grid(grid: RectilinearGrid, ax=None, *, plane: str | int = "z",
         title = (f"{_AXIS_NAMES[u_ax]}-{_AXIS_NAMES[w_ax]} mesh, "
                  f"{nu} x {nw} cells")
         if su > 1 or sw > 1:
-            title += f" (every {su}th / {sw}th line drawn)"
+            title += f" (1 line in {su} / 1 in {sw} drawn)"
     _finish_axes(ax, axis, aspect, title)
     return ax
 
@@ -888,8 +888,12 @@ def animate(result: Any, field: str | np.ndarray, plane: str | int = "z",
     else:
         hist = np.asarray(field, dtype=float)
         fname = "field"
-    if hist.ndim < 2:
-        raise ValueError("field history must have a leading time axis")
+    if hist.ndim < 2 or hist.shape[1:] not in (grid.shape_nodes,
+                                               (grid.n_nodes,)):
+        raise ValueError(
+            f"field history must have a leading time axis: expected shape "
+            f"(nt,) + {grid.shape_nodes} or (nt, {grid.n_nodes}), got "
+            f"{hist.shape}")
     if int(every) < 1:
         raise ValueError("every must be >= 1")
 
@@ -1013,10 +1017,8 @@ def plot_convergence(result: Any, ax=None, *, key: str | None = None,
     name, histories = _find_convergence(result, key)
     ax, _ = _get_ax(ax, figsize=(5.5, 4.0))
     multi = len(histories) > 1
-    for n, h in enumerate(histories):
+    for h in histories:
         y = np.abs(np.asarray(h, dtype=float).ravel())
-        if y.size == 0:
-            continue
         y = np.where(y > 0, y, np.nan)  # a zero residual is exact, not -inf
         ax.semilogy(np.arange(1, y.size + 1), y, marker=marker,
                     alpha=0.35 if multi else 1.0,
@@ -1084,17 +1086,21 @@ def _find_convergence(result: Any, key: str | None
 
 
 def _as_histories(raw: Any) -> list[np.ndarray]:
-    """Normalise a scalar / 1D / ragged-2D residual record to a list of 1D arrays."""
+    """Normalise a scalar / 1D / ragged-2D residual record to a list of 1D arrays.
+
+    Empty histories are dropped rather than drawn: a Newton solve that
+    converged on the predictor contributes no points, and an empty line would
+    otherwise leave a legend entry pointing at nothing.
+    """
     if np.isscalar(raw):
-        return [np.array([float(raw)])]
-    arr = np.asarray(raw, dtype=object) if _is_ragged(raw) else \
-        np.asarray(raw, dtype=float)
-    if arr.dtype == object:
-        return [np.asarray(h, dtype=float).ravel() for h in raw
-                if np.size(h) > 0]
-    if arr.ndim <= 1:
-        return [np.atleast_1d(arr)]
-    return [np.asarray(row, dtype=float).ravel() for row in arr]
+        out = [np.array([float(raw)])]
+    elif _is_ragged(raw):
+        out = [np.asarray(h, dtype=float).ravel() for h in raw]
+    else:
+        arr = np.asarray(raw, dtype=float)
+        out = ([np.atleast_1d(arr)] if arr.ndim <= 1
+               else [np.asarray(row, dtype=float).ravel() for row in arr])
+    return [h for h in out if h.size > 0]
 
 
 def _is_ragged(raw: Any) -> bool:

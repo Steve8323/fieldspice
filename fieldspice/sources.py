@@ -524,8 +524,9 @@ def prbs_sequence(order: int = 7, n: int | None = None,
         LFSR order; a key of :data:`PRBS_TAPS`.  Dimensionless.
     n
         Number of bits to generate.  Defaults to one full period,
-        ``2**order - 1``, which is refused above 24 bits of order because a
-        full period no longer fits in memory.
+        ``2**order - 1``.  Order 31 has a 2.1e9-bit period, which is past the
+        16 Mibit generation limit, so that default is refused; ask for the
+        number of bits you actually need instead.
     seed
         Initial LFSR state, dimensionless.  Any nonzero value works; ``0`` is
         mapped to the conventional all-ones state because the all-zero state is
@@ -815,7 +816,8 @@ class Waveform:
     def __call__(self, t: float | np.ndarray) -> float | np.ndarray:
         """Evaluate at time ``t`` [s]; scalar in, float out, array in, array out."""
         arr, scalar = _as_time(t)
-        return _out(np.asarray(self.func(t), dtype=float), scalar, arr.shape)
+        raw = self.func(float(arr) if scalar else arr)
+        return _out(np.asarray(raw, dtype=float), scalar, arr.shape)
 
     def sampled(self, t: Sequence[float] | np.ndarray) -> np.ndarray:
         """Evaluate on a time axis ``t`` [s], always returning an ``ndarray``."""
@@ -826,7 +828,7 @@ class Waveform:
     def delay(self, dt: float) -> "Waveform":
         """Shift later in time by ``dt`` [s]: the result is ``self(t - dt)``."""
         dt = _require_finite("dt", dt)
-        return Waveform(lambda t: self.func(np.asarray(t, dtype=float) - dt),
+        return Waveform(lambda t: self(np.asarray(t, dtype=float) - dt),
                         f"{self.name}.delay({dt:g})")
 
     def compose(self, fn: Callable[[float | np.ndarray], float | np.ndarray]
@@ -849,9 +851,7 @@ class Waveform:
     @staticmethod
     def _operand(other: object) -> Callable[..., float | np.ndarray] | None:
         """Coerce an operand to a callable, or ``None`` if it is not numeric."""
-        if isinstance(other, Waveform):
-            return other.func
-        if callable(other):
+        if callable(other):  # covers Waveform, whose __call__ normalises shape
             return other
         if isinstance(other, (int, float, np.integer, np.floating)):
             value = float(other)
