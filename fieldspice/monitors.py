@@ -71,6 +71,15 @@ Sign conventions (inherited from :mod:`fieldspice.operators`, get these right)
   ``I_inject = G^T M_sigma G phi`` --- note there is no minus sign on that
   form.  :class:`TerminalProbe` reports ``I_inject`` summed over the electrode,
   i.e. **positive current flows into the field region**.
+* Written in terms of the circulation the same statement is
+  ``I_inject = -G^T M_sigma e``, and that is the form every monitor here
+  actually evaluates.  The two are bit-for-bit identical when ``e = -G phi``
+  (negation is exact in IEEE arithmetic and the incidence entries are +-1),
+  but only the circulation form survives outside the electroquasistatic model:
+  in MQS, Darwin and full-wave runs ``e = -G phi - da/dt`` and the induced
+  part is simply not recoverable from ``phi``.  Reconstructing from ``phi``
+  when the solver offered ``e`` silently drops the inductive term, so no
+  monitor does it.
 
 Energy expressions
 ==================
@@ -157,6 +166,25 @@ def _axis_index(axis: str | int) -> int:
             f"axis must be one of 'x', 'y', 'z', 0, 1, 2; got {axis!r}")
     return idx
 
+
+def _element_kind(key: str) -> str | None:
+    """Grid element class a well-known state key lives on, else ``None``.
+
+    ``"node"``, ``"cell"``, ``"edge"`` or ``"face"``.  A function with a local
+    table rather than a module-level dict, for the same reason as
+    :func:`_axis_index`: ``docs/CONTRACTS.md`` forbids module-level mutable
+    state, and a dict is mutable however constant it looks.
+    """
+    table = {
+        "phi": "node", "psi": "node", "dphidt": "node",
+        "n": "node", "p": "node", "doping": "node", "rho": "node",
+        "e": "edge", "a": "edge", "dedt": "edge", "j": "edge", "i": "edge",
+        "eps_edge": "edge", "sigma_edge": "edge",
+        "b": "face", "h": "face", "mu_face": "face", "m_nu": "face",
+        "eps_cell": "cell", "sigma_cell": "cell", "mu_cell": "cell",
+        "material": "cell", "ids": "cell",
+    }
+    return table.get(key)
 
 
 class MonitorStateError(ValueError):
@@ -410,6 +438,7 @@ class Monitor(ABC):
         self.name = name
         self._t: list[float] = []
         self._series: dict[str, list[Any]] = {}
+        self._pending: dict[str, Any] = {}
         self._n_seen = 0
         self._warned: set[str] = set()
         self._cache = _GridCache()
@@ -417,6 +446,15 @@ class Monitor(ABC):
     # -- public API --------------------------------------------------------
     def record(self, state: Mapping[str, Any], t: float) -> None:
         """Sample the solver state.
+
+        The call is **atomic**: :meth:`_record` writes its samples into a
+        one-step staging buffer and they are committed to the series, together
+        with the time stamp, only if it returns cleanly.  A monitor that raises
+        part way through therefore leaves *nothing* behind rather than a
+        half-written sample, which is what makes
+        :class:`MonitorStateError` genuinely catchable --- the documented
+        "skip the monitor the solver cannot feed" workflow needs the failed
+        step to be a no-op, not a desynchronising partial write.
 
         Parameters
         ----------
@@ -433,7 +471,16 @@ class Monitor(ABC):
         self._n_seen += 1
         if not self._accept(state, tf):
             return
-        self._record(state, tf)
+        staged: dict[str, Any] = {}
+        self._pending = staged
+        try:
+            self._record(state, tf)
+        finally:
+            # Detach immediately so a stray emit after this call, or a partial
+            # emit from a raising _record, can never reach _series.
+            self._pending = {}
+        for key, value in staged.items():
+            self._series.setdefault(key, []).append(value)
         self._t.append(tf)
 
     def finalize(self) -> dict[str, np.ndarray]:
@@ -455,11 +502,23 @@ class Monitor(ABC):
         return out
 
     def reset(self) -> None:
-        """Discard all recorded data so the monitor can be reused."""
+        """Return the monitor to its just-constructed state so it can be reused.
+
+        This discards the recorded series *and* every per-run decision the
+        monitor made lazily: resolved node sets and edge selections, frozen
+        ``"auto"`` choices, and the one-frame history behind the backward
+        difference.  Keeping any of those across a reset is silently wrong ---
+        a reused probe would report the previous run's electrode, or open the
+        new run with a displacement current computed against the old run's
+        last frame.  Only the constructor arguments survive.
+        """
         self._t.clear()
         self._series.clear()
+        self._pending = {}
         self._n_seen = 0
         self._warned.clear()
+        self._cache = _GridCache()
+        self._reset_hook()
 
     @property
     def times(self) -> np.ndarray:
@@ -485,8 +544,17 @@ class Monitor(ABC):
         """Whether this call should be kept.  Overridden by strided monitors."""
         return True
 
+    def _reset_hook(self) -> None:
+        """Clear subclass state that must not outlive a run.  Default: nothing."""
+
     def _emit(self, key: str, value: Any) -> None:
-        self._series.setdefault(key, []).append(value)
+        """Stage one sample for ``key``; committed by :meth:`record`.
+
+        Emitting the same key twice in one step overwrites rather than
+        appending, so a subclass bug cannot ratchet one series out of step with
+        its siblings.
+        """
+        self._pending[key] = value
 
     def _warn_once(self, tag: str, msg: str) -> None:
         if tag not in self._warned:
@@ -556,7 +624,8 @@ class NodeProbe(Monitor):
         self._sel = node
         self.quantity = str(quantity)
         self.reduce = reduce
-        self._scalar = isinstance(node, (int, np.integer))
+        self._scalar0 = isinstance(node, (int, np.integer))
+        self._scalar = self._scalar0
         self._nodes: np.ndarray | None = None
         self.node_coords: tuple[float, float, float] | None = None
 
@@ -564,6 +633,13 @@ class NodeProbe(Monitor):
     def node_index(self) -> np.ndarray | None:
         """Flat node indices actually sampled, once resolved."""
         return self._nodes
+
+    def _reset_hook(self) -> None:
+        # The nearest node to a point, and a terminal-name lookup, both depend
+        # on the grid and the terminal set of the run that resolved them.
+        self._nodes = None
+        self.node_coords = None
+        self._scalar = self._scalar0
 
     def _resolve(self, state: Mapping[str, Any]) -> np.ndarray:
         if self._nodes is not None:
@@ -626,14 +702,20 @@ class TerminalProbe(Monitor):
 
     .. code-block:: text
 
-        I = sum_(nodes in terminal) [ G^T M_sigma G phi
-                                    + G^T M_eps   G dphi/dt ]
+        I = -sum_(nodes in terminal) [ G^T M_sigma e + G^T M_eps de/dt ]
+          =  sum_(nodes in terminal) [ G^T M_sigma G phi
+                                     + G^T M_eps   G dphi/dt ]   (EQS only)
 
     which is exactly the right-hand side the electroquasistatic solver would
     need to sustain the observed potential (see the sign discussion in the
     module docstring).  For a resistor held at ``V`` across ``R`` this returns
     ``+V/R`` at the high electrode and ``-V/R`` at the ground electrode; the
     two sum to zero, which is a useful runtime check on any solve.
+
+    The first (circulation) form is the one evaluated.  The second is what it
+    reduces to, bit for bit, when the state carries only ``phi``; it is *not*
+    equivalent when the state carries ``e``, because then ``e`` also holds the
+    induced ``-da/dt`` that no node potential can express.
 
     Parameters
     ----------
@@ -655,14 +737,21 @@ class TerminalProbe(Monitor):
 
     Notes
     -----
-    ``dphi/dt`` is taken from ``state["dphidt"]`` when the solver supplies it.
-    Otherwise it is a first-order **backward difference** between successive
-    records, so the very first sample carries zero displacement current --- an
-    unavoidable consequence of having seen only one frame, not a bug, but it
-    does mean the current at ``t = 0`` of a capacitive structure is
-    understated.  A solver that cares should pass ``dphidt`` or, better,
-    ``terminal_current``, which is used verbatim when present because the
-    solver knows it exactly.
+    ``de/dt`` is taken from ``state["dedt"]`` when the solver supplies it, then
+    from ``-G dphi/dt`` if ``state["dphidt"]`` is there instead.  Otherwise it
+    is a first-order **backward difference** between successive records, so the
+    very first sample carries zero displacement current --- an unavoidable
+    consequence of having seen only one frame, not a bug, but it does mean the
+    current at ``t = 0`` of a capacitive structure is understated.  A solver
+    that cares should pass ``dedt``/``dphidt`` or, better, ``terminal_current``.
+
+    ``state["terminal_current"]`` and ``state["terminal_voltage"]`` are used
+    **verbatim** when both name this terminal, and that check happens *before*
+    any terminal or electrode lookup.  The ordering is load-bearing: a solver
+    whose sources are not node sets --- the full-wave solver drives edges, and
+    publishes ``terminals={}`` --- knows both numbers exactly and can supply
+    nothing else.  Resolving the electrode first would make the documented fast
+    path unreachable for precisely the solvers that need it.
     """
 
     def __init__(self, terminal: Terminal | str, name: str | None = None,
@@ -683,48 +772,76 @@ class TerminalProbe(Monitor):
                 "TerminalProbe: voltage_from must be 'auto', 'phi' or 'declared'")
         super().__init__(name if name is not None else tname)
         self.terminal_name = tname
-        self._terminal: Terminal | None = (
+        self._terminal_given: Terminal | None = (
             terminal if _is_terminal(terminal) else None)
+        self._terminal: Terminal | None = self._terminal_given
         self._disp_req = displacement
         self._disp: bool | None = None
         self.voltage_from = voltage_from
         self._nodes: np.ndarray | None = None
-        self._phi_prev: np.ndarray | None = None
+        self._e_prev: np.ndarray | None = None
         self._t_prev: float | None = None
 
-    def _resolve(self, state: Mapping[str, Any],
-                 who: str) -> tuple[Terminal, np.ndarray, bool]:
+    def _reset_hook(self) -> None:
+        # _terminal_given came from the constructor and is configuration; a
+        # terminal found by name, the node set and the frozen 'auto' choice all
+        # belong to the run that resolved them.
+        self._terminal = self._terminal_given
+        self._nodes = None
+        self._disp = None
+        self._e_prev = None
+        self._t_prev = None
+
+    def _resolve_disp(self, state: Mapping[str, Any]) -> bool:
+        """Freeze the displacement decision, once, on the first record.
+
+        Deliberately does not touch the terminal or demand ``eps_edge``: the
+        verbatim ``terminal_current`` path needs this answer (to decide whether
+        to publish the ``i_cond``/``i_disp`` pair) but needs nothing else, and
+        ``eps_edge`` is required where it is actually read.
+        """
+        if self._disp is None:
+            self._disp = (_present(state, "eps_edge")
+                          if self._disp_req == "auto" else bool(self._disp_req))
+        return self._disp
+
+    def _resolve_electrode(self, state: Mapping[str, Any],
+                           who: str) -> tuple[Terminal, np.ndarray]:
         if self._terminal is None:
             self._terminal = _find_terminal(state, self.terminal_name, who)
         if self._nodes is None:
             grid = self._cache.grid(state, who)
             self._nodes = _resolve_nodes(self._terminal, state, who,
                                          grid.n_nodes)
-        if self._disp is None:
-            if self._disp_req == "auto":
-                self._disp = _present(state, "eps_edge")
-            else:
-                self._disp = bool(self._disp_req)
-            if self._disp:
-                _require(state, "eps_edge", who,
-                         "the displacement current term eps dphi/dt")
-        return self._terminal, self._nodes, self._disp
+        return self._terminal, self._nodes
 
     def _record(self, state: Mapping[str, Any], t: float) -> None:
         who = repr(self)
+        want_disp = self._resolve_disp(state)
+
+        tv = state.get("terminal_voltage")
+        ti = state.get("terminal_current")
+        v_given = (self.voltage_from == "auto" and isinstance(tv, Mapping)
+                   and self.terminal_name in tv)
+        i_given = isinstance(ti, Mapping) and self.terminal_name in ti
+
+        # Fast path, taken before anything is resolved: the solver knows both
+        # numbers exactly, so the electrode, the grid and the field are all
+        # irrelevant.  See the class Notes on why the ordering matters.
+        if v_given and i_given:
+            self._emit("v", float(tv[self.terminal_name]))
+            self._emit_given_current(float(ti[self.terminal_name]), want_disp)
+            return
+
         grid = self._cache.grid(state, who)
-        term, nodes, want_disp = self._resolve(state, who)
+        term, nodes = self._resolve_electrode(state, who)
 
         phi: np.ndarray | None = None
         if _present(state, "phi"):
             phi = _flat(state["phi"], grid.n_nodes, who, "phi")
 
         # -- voltage -------------------------------------------------------
-        v: float | None = None
-        tv = state.get("terminal_voltage")
-        if self.voltage_from == "auto" and isinstance(tv, Mapping) \
-                and self.terminal_name in tv:
-            v = float(tv[self.terminal_name])
+        v: float | None = float(tv[self.terminal_name]) if v_given else None
         if v is None and self.voltage_from in ("auto", "phi"):
             if phi is None and self.voltage_from == "phi":
                 _require(state, "phi", who, "voltage_from='phi'")
@@ -746,28 +863,18 @@ class TerminalProbe(Monitor):
         self._emit("v", v)
 
         # -- current -------------------------------------------------------
-        ti = state.get("terminal_current")
-        if isinstance(ti, Mapping) and self.terminal_name in ti:
-            self._emit("i", float(ti[self.terminal_name]))
-            if want_disp:
-                # The solver's number is authoritative but unsplit; do not
-                # invent a decomposition it did not provide.
-                self._emit("i_cond", float("nan"))
-                self._emit("i_disp", float("nan"))
-            self._remember(phi, t)
+        if i_given:
+            self._emit_given_current(float(ti[self.terminal_name]), want_disp)
             return
 
-        if phi is None:
-            _require(state, "phi", who,
-                     "reconstructing the terminal current from the field "
-                     "needs the node potential")
+        e = _edge_circulation(state, self._cache, who)
         G = self._cache.G(state, who)
         ratio = self._cache.edge_ratio(state, who)
 
         i_cond = 0.0
         if _present(state, "sigma_edge"):
             sig = _flat(state["sigma_edge"], grid.n_edges, who, "sigma_edge")
-            i_cond = float(np.sum((G.T @ ((sig * ratio) * (G @ phi)))[nodes]))
+            i_cond = -float(np.sum((G.T @ ((sig * ratio) * e))[nodes]))
         elif not want_disp:
             raise MonitorStateError(
                 f"{who} needs state['sigma_edge'] [S/m] or state['eps_edge'] "
@@ -776,27 +883,38 @@ class TerminalProbe(Monitor):
 
         i_disp = 0.0
         if want_disp:
-            eps = _flat(state["eps_edge"], grid.n_edges, who, "eps_edge")
-            dphi = self._dphidt(state, phi, t, grid, who)
-            if dphi is not None:
-                i_disp = float(np.sum(
-                    (G.T @ ((eps * ratio) * (G @ dphi)))[nodes]))
+            eps = _flat(_require(state, "eps_edge", who,
+                                 "the displacement current term eps de/dt"),
+                        grid.n_edges, who, "eps_edge")
+            dedt = self._dedt(state, e, t, grid, who)
+            if dedt is not None:
+                i_disp = -float(np.sum((G.T @ ((eps * ratio) * dedt))[nodes]))
             self._emit("i_cond", i_cond)
             self._emit("i_disp", i_disp)
-        self._emit("i", i_cond + i_disp)
-        self._remember(phi, t)
-
-    def _remember(self, phi: np.ndarray | None, t: float) -> None:
-        """Keep one frame of history for the backward-difference dphi/dt."""
-        if phi is not None:
-            self._phi_prev = np.array(phi, dtype=float, copy=True)
+            # One frame of history is only ever read by the backward
+            # difference, so do not pay for the copy when nothing will read it.
+            self._e_prev = np.array(e, dtype=float, copy=True)
             self._t_prev = t
+        self._emit("i", i_cond + i_disp)
 
-    def _dphidt(self, state: Mapping[str, Any], phi: np.ndarray, t: float,
-                grid: RectilinearGrid, who: str) -> np.ndarray | None:
+    def _emit_given_current(self, value: float, want_disp: bool) -> None:
+        """Publish a solver-supplied current [A] without touching the field."""
+        self._emit("i", value)
+        if want_disp:
+            # The solver's number is authoritative but unsplit; do not invent a
+            # decomposition it did not provide.
+            self._emit("i_cond", float("nan"))
+            self._emit("i_disp", float("nan"))
+
+    def _dedt(self, state: Mapping[str, Any], e: np.ndarray, t: float,
+              grid: RectilinearGrid, who: str) -> np.ndarray | None:
+        """de/dt on edges [V/s], or ``None`` when only one frame has been seen."""
+        if _present(state, "dedt"):
+            return _flat(state["dedt"], grid.n_edges, who, "dedt")
         if _present(state, "dphidt"):
-            return _flat(state["dphidt"], grid.n_nodes, who, "dphidt")
-        if self._phi_prev is None or self._t_prev is None:
+            dphidt = _flat(state["dphidt"], grid.n_nodes, who, "dphidt")
+            return -(self._cache.G(state, who) @ dphidt)
+        if self._e_prev is None or self._t_prev is None:
             return None
         dt = t - self._t_prev
         if dt <= 0.0:
@@ -804,7 +922,7 @@ class TerminalProbe(Monitor):
                 "dt", "non-increasing time between records; displacement "
                       "current set to zero for this sample")
             return None
-        return (phi - self._phi_prev) / dt
+        return (e - self._e_prev) / dt
 
 
 # ==========================================================================
@@ -855,6 +973,14 @@ class FieldSnapshot(Monitor):
     number of steps in advance, and appending is O(1) amortised, so the run
     itself never pays a reallocation.  Every frame is **copied** out of the
     state, because solvers legitimately reuse their work buffers.
+
+    Which shape a frame gets is decided from the *state key*, not from the
+    array's length.  The two disagree on grids where two element counts
+    coincide --- ``1x3x1`` has 16 nodes and also 16 faces --- and a length test
+    there reshapes a face vector into node shape, which ``Result.fields`` and
+    :func:`~fieldspice.operators.split_face_vector` both reject.  An
+    unrecognised key still falls back to its length, but only when that length
+    is unambiguous; an ambiguous one stays flat and warns once.
     """
 
     _emit_time = True
@@ -882,6 +1008,9 @@ class FieldSnapshot(Monitor):
         self.max_frames = None if max_frames is None else int(max_frames)
         self.bytes_per_frame: int = 0
 
+    def _reset_hook(self) -> None:
+        self.bytes_per_frame = 0
+
     def _accept(self, state: Mapping[str, Any], t: float) -> bool:
         step = state.get("step")
         idx = int(step) if step is not None else self._n_seen - 1
@@ -901,18 +1030,38 @@ class FieldSnapshot(Monitor):
             raw = _require(state, key, who,
                            f"FieldSnapshot stores the field {key!r}")
             arr = np.array(raw, dtype=self.dtype, copy=True)
-            if self.reshape:
-                if arr.size == grid.n_nodes:
-                    arr = arr.reshape(grid.shape_nodes)
-                elif arr.size == grid.n_cells:
-                    arr = arr.reshape(grid.shape_cells)
-                else:
-                    arr = arr.ravel()
-            else:
-                arr = arr.ravel()
+            arr = self._shaped(arr, key, grid) if self.reshape else arr.ravel()
             self._emit(key if len(self.fields) > 1 else "", arr)
             total += arr.nbytes
         self.bytes_per_frame = total
+
+    def _shaped(self, arr: np.ndarray, key: str,
+                grid: RectilinearGrid) -> np.ndarray:
+        """Give one frame the shape ``Result.fields`` specifies for its key."""
+        kind = _element_kind(key)
+        sizes = {"node": grid.n_nodes, "cell": grid.n_cells,
+                 "edge": grid.n_edges, "face": grid.n_faces}
+        if kind is None:
+            hits = [k for k, n in sizes.items() if arr.size == n]
+            if len(hits) == 1:
+                kind = hits[0]
+            elif len(hits) > 1:
+                self._warn_once(
+                    f"ambiguous:{key}",
+                    f"field {key!r} has {arr.size} entries, which is both the "
+                    f"{' and the '.join(hits)} count on this grid; storing it "
+                    f"flat. Rename it to a known key, or pass reshape=False.")
+        elif arr.size != sizes[kind]:
+            self._warn_once(
+                f"size:{key}",
+                f"field {key!r} lives on {kind}s ({sizes[kind]} of them) but "
+                f"the state supplied {arr.size} entries; storing it flat.")
+            kind = None
+        if kind == "node":
+            return arr.reshape(grid.shape_nodes)
+        if kind == "cell":
+            return arr.reshape(grid.shape_cells)
+        return arr.ravel()
 
 
 # ==========================================================================
@@ -989,6 +1138,11 @@ class EnergyMonitor(Monitor):
             self._requested = comps
         self.components_used: tuple[str, ...] = ()
 
+    def _reset_hook(self) -> None:
+        # components='auto' is decided from the first state of a run; a new run
+        # may well carry 'b' where the old one did not.
+        self.components_used = ()
+
     def _resolve(self, state: Mapping[str, Any], who: str) -> None:
         if self.components_used:
             return
@@ -1040,17 +1194,25 @@ class EnergyMonitor(Monitor):
             e = _edge_circulation(state, self._cache, who)
             ratio = self._cache.edge_ratio(state, who)
             e2 = e * e
+            # _require, not state[...]: the component set was frozen on the
+            # first record, and a state that later drops a key must still give
+            # the diagnosable error the module docstring promises, not a bare
+            # KeyError from somewhere inside the arithmetic.
             if "electric" in comps:
-                eps = _flat(state["eps_edge"], grid.n_edges, who, "eps_edge")
+                eps = _flat(_require(state, "eps_edge", who,
+                                     "component 'electric'"),
+                            grid.n_edges, who, "eps_edge")
                 w_e = 0.5 * float(np.dot(eps * ratio, e2))
                 self._emit("electric", w_e)
             if "dissipation" in comps:
-                sig = _flat(state["sigma_edge"], grid.n_edges, who,
-                            "sigma_edge")
+                sig = _flat(_require(state, "sigma_edge", who,
+                                     "component 'dissipation'"),
+                            grid.n_edges, who, "sigma_edge")
                 self._emit("dissipation", float(np.dot(sig * ratio, e2)))
 
         if "magnetic" in comps:
-            b = _flat(state["b"], grid.n_faces, who, "b")
+            b = _flat(_require(state, "b", who, "component 'magnetic'"),
+                      grid.n_faces, who, "b")
             nu = self._reluctance(state, grid, who)
             w_m = 0.5 * float(np.dot(nu, b * b))
             self._emit("magnetic", w_m)
@@ -1065,7 +1227,9 @@ class EnergyMonitor(Monitor):
             m_nu = state["m_nu"]
             diag = m_nu.diagonal() if sp.issparse(m_nu) else np.asarray(m_nu)
             return _flat(diag, grid.n_faces, who, "m_nu")
-        mu = _flat(state["mu_face"], grid.n_faces, who, "mu_face")
+        mu = _flat(_require(state, "mu_face", who,
+                            "component 'magnetic' without state['m_nu']"),
+                   grid.n_faces, who, "mu_face")
         if np.any(mu <= 0.0):
             raise ValueError(f"{who}: mu_face must be strictly positive [H/m]")
         return self._cache.face_ratio(state, who) / mu
@@ -1186,6 +1350,17 @@ class FluxMonitor(Monitor):
         self._t_prev: float | None = None
         self.n_edges_cut: int = 0
 
+    def _reset_hook(self) -> None:
+        # A plane snaps to an edge layer of a particular grid, and the one-frame
+        # history belongs to the run that produced it: carrying either into a
+        # second run reports the wrong surface, or a de/dt taken across the
+        # boundary between two unrelated solves.
+        self._edges = None
+        self._signs = None
+        self._e_prev = None
+        self._t_prev = None
+        self.n_edges_cut = 0
+
     # -- surface resolution -----------------------------------------------
     def _resolve(self, state: Mapping[str, Any],
                  who: str) -> tuple[np.ndarray, np.ndarray]:
@@ -1293,9 +1468,11 @@ class FluxMonitor(Monitor):
                 f"state['eps_edge'].")
 
         if not self.include_displacement:
+            # No history here: _e_prev is read only by the backward difference
+            # in _dedt, which this branch never reaches, and copying the whole
+            # edge vector every step is a measurable fraction of the monitor's
+            # cost on a large grid (5.4 MB per step at 60^3).
             self._emit("", i_cond)
-            self._e_prev = np.array(e, dtype=float, copy=True)
-            self._t_prev = t
             return
 
         eps = _flat(_require(state, "eps_edge", who,
@@ -1334,13 +1511,18 @@ class ChargeMonitor(Monitor):
     Two independent routes, because they answer different questions:
 
     ``mode="gauss"`` (default)
-        ``Q = sum_nodes (G^T M_eps G phi)``.  This is the discrete Gauss law
-        with ``G^T M_eps G`` the nodal capacitance matrix, so summed over an
-        electrode it gives the **free charge on that electrode**, and
-        ``Q / V`` is its self-capacitance.  Summed over *all* nodes it gives
-        the net free charge in the domain, which is a machine-precision zero
-        for any isolated system --- a cheap and very sharp correctness check
-        on a solve.
+        ``Q = -sum_nodes (G^T M_eps e)``, which is ``sum_nodes (G^T M_eps G
+        phi)`` whenever ``e = -G phi``.  ``M_eps e`` is the electric flux
+        through each dual face, positive along the edge, so ``G^T`` of it is
+        the flux *into* the node and the enclosed charge is minus that.  This
+        is the discrete Gauss law with ``G^T M_eps G`` the nodal capacitance
+        matrix, so summed over an electrode it gives the **free charge on that
+        electrode**, and ``Q / V`` is its self-capacitance.  Summed over *all*
+        nodes it gives the net free charge in the domain, which is a
+        machine-precision zero for any isolated system --- a cheap and very
+        sharp correctness check on a solve.  Needs ``e`` or ``phi``; it prefers
+        ``e``, so it is correct in a run with an induced field, where the
+        charge implied by ``-G phi`` alone is simply the wrong number.
 
     ``mode="carriers"``
         ``Q = q * sum_nodes (p - n + doping) * V_node``, the semiconductor
@@ -1371,6 +1553,11 @@ class ChargeMonitor(Monitor):
         self._sel = nodes
         self._nodes: np.ndarray | None = None
 
+    def _reset_hook(self) -> None:
+        # A terminal name or a boolean mask resolves against one grid and one
+        # terminal set; both can change between runs.
+        self._nodes = None
+
     def _resolve(self, state: Mapping[str, Any], who: str) -> np.ndarray | None:
         """``None`` means "all nodes", which lets us skip the fancy indexing."""
         if self._sel is None:
@@ -1386,15 +1573,17 @@ class ChargeMonitor(Monitor):
         idx = self._resolve(state, who)
 
         if self.mode == "gauss":
-            phi = _flat(_require(state, "phi", who,
-                                 "Gauss-law charge needs the node potential"),
-                        grid.n_nodes, who, "phi")
+            e = _edge_circulation(state, self._cache, who)
             eps = _flat(_require(state, "eps_edge", who,
                                  "Gauss-law charge needs the edge permittivity"),
                         grid.n_edges, who, "eps_edge")
             G = self._cache.G(state, who)
             ratio = self._cache.edge_ratio(state, who)
-            qn = G.T @ ((eps * ratio) * (G @ phi))
+            # Enclosed charge is the flux *out* of the dual box, and G^T gives
+            # the flux in, hence the sign.  Identical to +G^T M_eps G phi in the
+            # phi-only case, and right rather than merely different when the
+            # state carries an induced e.
+            qn = -(G.T @ ((eps * ratio) * e))
         else:
             n = _flat(_require(state, "n", who,
                                "carrier charge needs the electron density"),
@@ -1461,13 +1650,49 @@ class MonitorSet:
         self._monitors[monitor.name] = monitor
         return monitor
 
+    def remove(self, name: str) -> Monitor:
+        """Drop a monitor from the set and return it.
+
+        The counterpart to catching :class:`MonitorStateError`: a solver that
+        finds it cannot feed a monitor should remove it rather than keep
+        calling it, so the error is reported once instead of every step.
+        """
+        if name not in self._monitors:
+            raise ValueError(
+                f"MonitorSet has no monitor named {name!r}; it holds "
+                f"{sorted(self._monitors)}")
+        return self._monitors.pop(name)
+
     # -- the loop ----------------------------------------------------------
     def record(self, state: Mapping[str, Any], t: float) -> None:
-        """Forward one sample to every monitor."""
+        """Forward one sample to every monitor.
+
+        Every monitor is offered the step even if an earlier one raised, and
+        the master time axis advances either way; the first exception is
+        re-raised afterwards.  Bailing out on the first failure instead would
+        make the set's raggedness depend on insertion order --- monitors after
+        the broken one would silently miss the step, and the master ``"t"``
+        axis would stop advancing while the healthy series kept growing.  This
+        way the only series short of ``"t"`` are the ones that genuinely could
+        not be computed, and each monitor is internally consistent because
+        :meth:`Monitor.record` is atomic.
+
+        Raises
+        ------
+        Exception
+            The first error raised by any monitor, after all of them have been
+            given the step.
+        """
         tf = float(t)
+        errors: list[Exception] = []
         for mon in self._monitors.values():
-            mon.record(state, tf)
+            try:
+                mon.record(state, tf)
+            except Exception as exc:  # re-raised below, never swallowed
+                errors.append(exc)
         self._t.append(tf)
+        if errors:
+            raise errors[0]
 
     def finalize(self) -> dict[str, np.ndarray]:
         """Merge every monitor's output, plus the master time axis ``"t"`` [s].
@@ -1492,16 +1717,33 @@ class MonitorSet:
         """``{terminal: {"v": (nt,), "i": (nt,)}}`` from every TerminalProbe.
 
         The shape :attr:`fieldspice.solvers.base.Result.terminals` wants, so a
-        solver can assign it straight across.
+        solver can assign it straight across.  A probe that recorded nothing
+        --- a zero-step run, or one the solver skipped --- contributes empty
+        arrays rather than raising, because a solver calls this unconditionally
+        after the loop and a missing series is not an error there.
+
+        Raises
+        ------
+        ValueError
+            If a probe that *did* record is missing its ``v`` or ``i`` series,
+            which would mean the probe itself is broken.
         """
         out: dict[str, dict[str, np.ndarray]] = {}
         for mon in self._monitors.values():
-            if isinstance(mon, TerminalProbe):
-                data = mon.finalize()
-                out[mon.terminal_name] = {
-                    "v": data[f"{mon.name}.v"],
-                    "i": data[f"{mon.name}.i"],
-                }
+            if not isinstance(mon, TerminalProbe):
+                continue
+            if mon.n_records == 0:
+                out[mon.terminal_name] = {"v": np.zeros(0), "i": np.zeros(0)}
+                continue
+            data = mon.finalize()
+            keys = (f"{mon.name}.v", f"{mon.name}.i")
+            missing = [k for k in keys if k not in data]
+            if missing:
+                raise ValueError(
+                    f"TerminalProbe {mon.name!r} kept {mon.n_records} records "
+                    f"but published no {missing}; it cannot fill "
+                    f"Result.terminals[{mon.terminal_name!r}]")
+            out[mon.terminal_name] = {"v": data[keys[0]], "i": data[keys[1]]}
         return out
 
     def reset(self) -> None:

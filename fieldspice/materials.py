@@ -932,26 +932,27 @@ def mix_property(old: np.ndarray | float, new: float,
 _LINEAR = ("linear", "parallel", "arithmetic")
 _HARMONIC = ("harmonic", "series")
 
+# Property key -> the Material attribute it mixes.
+_PROPS = {"eps": "eps_r", "sigma": "sigma", "mu": "mu_r"}
 
-def _accumulate(prop: np.ndarray, bg: float, new: float,
-                fill: np.ndarray, cov: np.ndarray, rule: str,
-                what: str) -> np.ndarray:
-    """Add one phase to a partially filled cell without re-mixing the background.
+
+def _accumulate(acc: np.ndarray, cov: np.ndarray, fill: np.ndarray,
+                new: float, rule: str, what: str) -> np.ndarray:
+    """Add one phase to the per-cell effective-medium accumulator.
 
     Parameters
     ----------
-    prop : np.ndarray
-        Current effective property per cell (any units), shape
+    acc : np.ndarray
+        Accumulator ``sum_i f_i T(p_i)`` over the phases assigned so far, in
+        the transformed domain of ``rule`` (see Notes).  Shape
         ``grid.shape_cells``.
-    bg : float
-        The background material's value of the same property, same units.
-    new : float
-        The incoming phase's value, same units.
+    cov : np.ndarray
+        Volume fraction of each cell already claimed by those phases, in
+        ``[0, 1]``, *before* this call.
     fill : np.ndarray
         Volume fraction of the incoming phase per cell, in ``[0, 1]``.
-    cov : np.ndarray
-        Volume fraction of each cell already occupied by previously assigned
-        phases, in ``[0, 1]``, *before* this call.
+    new : float
+        The incoming phase's property value (any units, same as ``acc``).
     rule : {"linear", "harmonic"}
         Effective-medium rule; see :func:`mix_property`.
     what : str
@@ -960,23 +961,33 @@ def _accumulate(prop: np.ndarray, bg: float, new: float,
     Returns
     -------
     np.ndarray
-        Updated effective property, shape ``grid.shape_cells``.
+        Updated accumulator, shape ``grid.shape_cells``.
 
     Notes
     -----
-    Tagged **A2**.  The invariant maintained across calls is
+    Tagged **A2**.  The invariant the map maintains is
 
     ``T(p_cell) = (1 - A) T(p_bg) + sum_i f_i T(p_i)``
 
     with ``T = identity`` for the linear rule and ``T = 1/x`` for the harmonic
     one, ``A = sum_i f_i`` the accumulated coverage and ``f_i`` the fill
-    fraction of each assigned phase.  Because the background enters exactly
-    once, weighted by the fraction of the cell nothing has claimed, a cell that
-    two phases fill completely contains no background at all and the answer does
-    not depend on the order of the two :meth:`MaterialMap.assign` calls.  The
-    naive alternative --- blending each new phase against the running cell value
-    --- leaves ``(1-f_A)(1-f_B)`` of background behind and can land *outside* the
-    Wiener bounds, which is worse than not mixing at all.
+    fraction of each assigned phase.  This function carries the second term;
+    :meth:`MaterialMap._effective` adds the first and inverts ``T``.
+
+    Because the background enters exactly once, weighted by the fraction of the
+    cell that nothing has claimed, a cell two phases fill completely holds no
+    background at all and the answer does not depend on the order of the two
+    :meth:`MaterialMap.assign` calls.  The naive alternative --- blending each
+    new phase against the running cell value --- leaves ``(1-f_A)(1-f_B)`` of
+    background behind and can land *outside* the Wiener bounds, which is worse
+    than not mixing at all.
+
+    Keeping the sum as its own array rather than recovering it from the current
+    effective value is not redundancy: recovering it costs a subtraction
+    ``T(p) - (1-A) T(p_bg)`` that cancels catastrophically when the background
+    and the phases differ by many decades.  With a 1e-14 S/m oxide background
+    and two metal phases the metal term is annihilated entirely and the answer
+    comes out 65 percent high.
 
     When ``fill`` exceeds the unclaimed remainder ``1 - A`` the incoming phase
     displaces the phases already present, scaled down proportionally so the
@@ -984,26 +995,22 @@ def _accumulate(prop: np.ndarray, bg: float, new: float,
     overwrites the cell outright, which is the documented behaviour of a boolean
     mask.
     """
-    free = np.clip(1.0 - cov, 0.0, 1.0)
-    over = fill > free
-    # `over` implies cov > 0 (fill <= 1 = free + cov), so the divisor is safe;
-    # the np.where only keeps NumPy from evaluating 0/0 in the untaken branch.
+    new = float(new)
+    over = fill > np.clip(1.0 - cov, 0.0, 1.0)
+    # `over` implies cov > 0 (since fill <= 1 = free + cov), so the divisor is
+    # safe; the inner np.where only keeps NumPy from evaluating 0/0 in the
+    # branch that is thrown away.
     scale = np.where(over, (1.0 - fill) / np.where(cov > 0.0, cov, 1.0), 1.0)
-    free_new = np.where(over, 0.0, free - fill)
-
     if rule in _LINEAR:
-        assigned = prop - free * bg          # sum_i f_i p_i carried so far
-        return free_new * bg + scale * assigned + fill * float(new)
+        return scale * acc + fill * new
     if rule in _HARMONIC:
-        if bg <= 0.0 or float(new) <= 0.0 or np.any(prop <= 0.0):
+        if new <= 0.0:
             raise ValueError(
-                f"harmonic mixing of {what} needs strictly positive values "
-                "everywhere (a zero-valued phase drives the harmonic mean to "
+                f"harmonic mixing of {what} needs a strictly positive value, "
+                f"got {new!r} (a zero-valued phase drives the harmonic mean to "
                 "zero, which would disconnect the mesh); use the linear rule "
-                "for conductivity, or give the background a small nonzero "
-                f"{what}")
-        assigned = 1.0 / prop - free / bg
-        return 1.0 / (free_new / bg + scale * assigned + fill / float(new))
+                "for conductivity")
+        return scale * acc + fill / new
     raise ValueError(f"unknown mixing rule {rule!r}, expected 'linear' or 'harmonic'")
 
 
@@ -1057,9 +1064,6 @@ class MaterialMap:
         self.grid = grid
         bg = get(background)
         shape = grid.shape_cells
-        self._eps_r = np.full(shape, bg.eps_r, dtype=float)
-        self._mu_r = np.full(shape, bg.mu_r, dtype=float)
-        self._sigma = np.full(shape, bg.sigma, dtype=float)
         self._ids = np.zeros(shape, dtype=np.int32)
         self._materials: list[Material] = [bg]
         self._index: dict[str, int] = {bg.name: 0}
@@ -1067,13 +1071,39 @@ class MaterialMap:
         # occupies exactly the remainder, which is what keeps a multi-phase cell
         # free of phantom background and independent of assignment order.
         self._cov = np.zeros(shape, dtype=float)
-        # Which effective-medium rule each partially filled cell was blended
-        # with, per property (0 none, 1 linear, 2 harmonic).  Accumulating one
-        # cell under both rules is meaningless -- the linear and harmonic
-        # accumulators live in different domains and combining them can drive a
-        # permittivity negative -- so it is rejected rather than averaged.
-        self._rule: dict[str, np.ndarray] = {
-            k: np.zeros(shape, dtype=np.uint8) for k in ("eps", "sigma", "mu")}
+        # sum_i f_i T(p_i) per cell, one array per property.  The effective
+        # value is reconstructed in _effective(); storing the sum rather than
+        # the value keeps a metal-in-oxide harmonic blend from cancelling to
+        # nothing.  See _accumulate().
+        self._acc: dict[str, np.ndarray] = {
+            k: np.zeros(shape, dtype=float) for k in _PROPS}
+        # Which domain each accumulator is in, per cell and per property
+        # (0 untouched, 1 linear, 2 harmonic).  Accumulating one *blended* cell
+        # under both rules is meaningless -- the two live in different domains
+        # and adding a harmonic term to a linear one can drive a permittivity
+        # negative -- so it is rejected rather than averaged.
+        self._dom: dict[str, np.ndarray] = {
+            k: np.zeros(shape, dtype=np.uint8) for k in _PROPS}
+        # True where the cell holds a genuine mixture rather than one phase or
+        # pure background; only these cells are rule-locked.
+        self._blended = np.zeros(shape, dtype=bool)
+
+    def _effective(self, what: str) -> np.ndarray:
+        """Reconstruct an effective per-cell property from the accumulator.
+
+        ``T(p) = (1 - A) T(p_bg) + acc`` inverted, with ``T`` chosen per cell by
+        the rule that cell was blended with.  Untouched cells (``dom == 0``,
+        ``acc == 0``, ``A == 0``) come out bit-exactly equal to the background.
+        """
+        bg = getattr(self._materials[0], _PROPS[what])
+        acc, dom = self._acc[what], self._dom[what]
+        free = np.clip(1.0 - self._cov, 0.0, 1.0)
+        out = free * bg + acc
+        harm = dom == 2
+        if np.any(harm):
+            # bg > 0 is guaranteed wherever a harmonic blend was accepted.
+            out[harm] = 1.0 / (free[harm] / bg + acc[harm])
+        return out
 
     # -- introspection -----------------------------------------------------
     @property
@@ -1108,7 +1138,8 @@ class MaterialMap:
 
     # -- assignment --------------------------------------------------------
     def assign(self, mask: np.ndarray, material: str | Material,
-               mix: str = "linear", mix_sigma: str = "linear") -> None:
+               mix: str = "linear", mix_sigma: str = "linear",
+               mix_mu: str = "harmonic") -> None:
         """Place a material into the cells selected by ``mask``.
 
         Parameters
@@ -1117,8 +1148,11 @@ class MaterialMap:
             Either a **boolean** array (hard 0/1 selection) or a **float**
             array of sub-cell fill fractions in ``[0, 1]``, as produced by
             :func:`fieldspice.geometry.voxelize`.  Shape must be
-            ``grid.shape_cells``, or any shape that broadcasts to it
-            (``(Nx, 1, 1)`` for a slab, for instance).
+            ``grid.shape_cells``, or a 3-D shape whose every axis is either 1 or
+            the matching cell count (``(Nx, 1, 1)`` for a slab, for instance).
+            A scalar fills the whole grid.  Rank-1 and rank-2 arrays are
+            **rejected**: NumPy would align them with the trailing axes, so a
+            ``(Nx, Ny)`` mask would silently land on ``(Ny, Nz)``.
         material : str or Material
             What to put there.
         mix : {"linear", "harmonic"}
@@ -1135,18 +1169,35 @@ class MaterialMap:
             identically, so a cell straddling a *perpendicular* interface
             strictly wants both mixed harmonically to get its RC time constant
             right.
+        mix_mu : {"linear", "harmonic"}
+            Rule for **permeability**.  ``mix`` governs eps only; mu has its own
+            keyword because its default differs.  ``"harmonic"`` is the default
+            to match :func:`fieldspice.operators.cell_to_face`, which combines
+            the two cells threading a face in series along the magnetic path.
+            That is the right choice for flux crossing an interface and the
+            wrong one for flux running along it: a cell half full of ``mu_r =
+            800`` ferrite mixes harmonically to ``mu_r = 2.0`` and linearly to
+            ``400.5``.  If the core surface in your problem is parallel to the
+            flux, pass ``mix_mu="linear"``.
+
         Returns
         -------
         None
-            The map is modified in place; later calls overwrite earlier ones
-            where ``fill == 1`` and blend where ``0 < fill < 1``.
+            The map is modified in place.  Fills **accumulate**: each cell
+            tracks the fraction claimed so far (:meth:`coverage`) and the
+            background occupies only what is left, so two half-filled phases
+            leave no background behind and the result does not depend on the
+            order of the calls.  Where the fills overrun a cell the newest one
+            wins and displaces the phases already there proportionally;
+            ``fill == 1`` therefore overwrites outright.
 
         Raises
         ------
         ValueError
-            On a shape that does not broadcast to the cell grid, on fill values
-            outside ``[0, 1]``, on NaN, or on a name already used in this map by
-            a different material.
+            On a mask that is not 0-D or 3-D or whose axes do not match the cell
+            grid, on fill values outside ``[0, 1]``, on NaN, on a name already
+            used in this map by a different material, or on a partially filled
+            cell being blended under two different mixing rules.
 
         Notes
         -----
@@ -1156,6 +1207,24 @@ class MaterialMap:
         needs an unambiguous :class:`SemiconductorParams` per cell -- run
         semiconductor problems with hard masks (``voxelize(..., subsample=1)``)
         so that no cell is ambiguous.
+
+        One mixing rule per *mixed* cell per property is enforced.  The linear
+        and harmonic accumulators live in different domains (``p`` and ``1/p``),
+        and blending one cell under both is not merely inaccurate: adding a
+        harmonic contribution on top of a linear one can make the reciprocal sum
+        negative, i.e. produce a negative permittivity.  A cell holding a single
+        phase is exempt, since both rules return that phase unchanged, so
+        overwriting a region with ``fill == 1`` frees its rule again.
+
+        Examples
+        --------
+        >>> from fieldspice.grid import RectilinearGrid
+        >>> g = RectilinearGrid.uniform([(0, 1e-6)] * 3, (1, 1, 1))
+        >>> mm = MaterialMap(g, "vacuum")
+        >>> mm.assign(np.full(g.shape_cells, 0.5), "si")
+        >>> mm.assign(np.full(g.shape_cells, 0.5), "sio2")
+        >>> float(mm.eps_r()[0, 0, 0])          # 0.5*11.7 + 0.5*3.9, no vacuum
+        7.8
         """
         mat = get(material)
         f = self._as_fill(mask)
@@ -1165,25 +1234,101 @@ class MaterialMap:
             raise ValueError(
                 f"a different material is already registered in this map under "
                 f"the name {mat.name!r}; rename one of them")
-        if prev is None:
-            prev = len(self._materials)
-            self._materials.append(mat)
-            self._index[mat.name] = prev
 
+        rules = {"eps": mix, "sigma": mix_sigma, "mu": mix_mu}
         touched = f > 0.0
-        if not np.any(touched):
-            return  # material still recorded, so ids stay stable across runs
+        acc = {}
+        for what, rule in rules.items():
+            acc[what] = _accumulate(self._convert(what, rule, f, touched),
+                                    self._cov, f, getattr(mat, _PROPS[what]),
+                                    rule, _PROPS[what])
+        if np.any(touched) and any(r in _HARMONIC for r in rules.values()):
+            self._check_harmonic_background(rules)
 
-        self._eps_r = mix_property(self._eps_r, mat.eps_r, f, rule=mix)
-        self._sigma = mix_property(self._sigma, mat.sigma, f, rule=mix_sigma)
-        # mu is mixed harmonically because the dual edge threading a face
-        # crosses its two cells in series along the magnetic path, which is the
-        # same convention operators.cell_to_face uses by default.
-        self._mu_r = mix_property(self._mu_r, mat.mu_r, f, rule="harmonic")
+        # Commit only after every property has succeeded, so a rejected
+        # harmonic mix leaves the map exactly as it was.
+        prev = self._register(mat)
+        if not np.any(touched):
+            return  # material recorded, so ids stay stable across runs
+        self._acc = acc
+        self._cov = np.clip(self._cov + f, 0.0, 1.0)
         self._ids = np.where(f >= 0.5, np.int32(prev), self._ids)
+        blended, full = touched & (f < 1.0), f >= 1.0
+        self._blended[blended] = True
+        self._blended[full] = False
+        for what, rule in rules.items():
+            self._dom[what][touched] = 1 if rule in _LINEAR else 2
+
+    def _register(self, mat: Material) -> int:
+        """Id of ``mat`` in this map, allocating one on first use."""
+        idx = self._index.get(mat.name)
+        if idx is None:
+            idx = len(self._materials)
+            self._materials.append(mat)
+            self._index[mat.name] = idx
+        return idx
+
+    def _check_harmonic_background(self, rules: dict[str, str]) -> None:
+        """A harmonic blend needs a strictly positive background value."""
+        bgm = self._materials[0]
+        for what, rule in rules.items():
+            v = getattr(bgm, _PROPS[what])
+            if rule in _HARMONIC and v <= 0.0:
+                raise ValueError(
+                    f"harmonic mixing of {_PROPS[what]} needs a strictly "
+                    f"positive background, but {bgm.name!r} has "
+                    f"{_PROPS[what]} = {v!r}; the background would contribute "
+                    "an infinite reciprocal. Use the linear rule for "
+                    "conductivity, or pick a background with a small nonzero "
+                    "value (sio2 rather than vacuum).")
+
+    def _convert(self, what: str, rule: str, f: np.ndarray,
+                 touched: np.ndarray) -> np.ndarray:
+        """Accumulator for ``what``, moved into ``rule``'s domain where legal.
+
+        A cell holding a single phase (or nothing) can switch rules freely --
+        with one phase at full coverage both rules give the same effective
+        value -- and its accumulator converts by a reciprocal.  A *blended*
+        cell cannot: the linear and harmonic sums live in different domains and
+        adding one to the other is meaningless, so it raises.
+        """
+        if rule not in _LINEAR and rule not in _HARMONIC:
+            raise ValueError(
+                f"unknown mixing rule {rule!r} for {what}, expected 'linear' "
+                "or 'harmonic'")
+        code = 1 if rule in _LINEAR else 2
+        dom = self._dom[what]
+        stale = (dom != 0) & (dom != code) & touched
+        clash = stale & self._blended & (f < 1.0)
+        n = int(np.count_nonzero(clash))
+        if n:
+            other = "linear" if code == 2 else "harmonic"
+            raise ValueError(
+                f"{n} cell(s) already hold a {other!r} mixture of {what} and "
+                f"this call asks for {rule!r}; the two accumulate in different "
+                "domains and cannot be combined in one cell. Use one rule per "
+                "map, or overwrite those cells with a fill of 1 first.")
+        acc = self._acc[what]
+        convert = stale & (f < 1.0)     # f == 1 discards the old content anyway
+        if not np.any(convert):
+            return acc
+        if np.any(acc[convert] <= 0.0):
+            raise ValueError(
+                f"cannot switch the {what} mixing rule to {rule!r} in a cell "
+                "holding a zero-valued phase: the reciprocal is infinite. "
+                "Overwrite those cells with a fill of 1 instead.")
+        acc = acc.copy()
+        acc[convert] = 1.0 / acc[convert]
+        return acc
 
     def _as_fill(self, mask: np.ndarray) -> np.ndarray:
-        """Validate and normalise a mask/fill array to float in [0, 1]."""
+        """Validate and normalise a mask/fill array to float in [0, 1].
+
+        Rank is checked rather than left to NumPy broadcasting: broadcasting
+        aligns *trailing* axes, so a ``(Nx, Ny)`` mask would be applied to the
+        ``(Ny, Nz)`` face of the grid and produce a silently wrong geometry.
+        ``docs/CONTRACTS.md`` rule 7 forbids that coercion.
+        """
         a = np.asarray(mask)
         if a.dtype == bool:
             a = a.astype(float)
@@ -1196,14 +1341,18 @@ class MaterialMap:
                     f"fill fractions must lie in [0, 1], got range "
                     f"[{a.min():g}, {a.max():g}]")
         shape = self.grid.shape_cells
-        if a.shape == shape:
-            return a
-        try:
-            return np.broadcast_to(a, shape).astype(float)
-        except ValueError:
+        if a.ndim == 0:
+            return np.full(shape, float(a))
+        if a.ndim != 3:
             raise ValueError(
-                f"mask shape {a.shape} does not match or broadcast to the cell "
-                f"grid {shape}") from None
+                f"mask must be 3-D (or scalar) to be unambiguous on a "
+                f"{shape} cell grid, got a {a.ndim}-D array of shape {a.shape}; "
+                "add the missing axes explicitly, e.g. mask[:, :, None]")
+        if any(n not in (1, s) for n, s in zip(a.shape, shape)):
+            raise ValueError(
+                f"mask shape {a.shape} does not match the cell grid {shape}; "
+                "each axis must be either 1 (broadcast) or the cell count")
+        return np.broadcast_to(a, shape).astype(float)
 
     # -- property arrays ---------------------------------------------------
     def eps(self) -> np.ndarray:
@@ -1213,23 +1362,40 @@ class MaterialMap:
         ``operators.cell_to_edge(grid, matmap.eps())`` and then to
         ``operators.edge_mass`` to get edge capacitances in farads.
         """
-        return eps0 * self._eps_r
+        return eps0 * self._effective("eps")
 
     def mu(self) -> np.ndarray:
         """Absolute permeability per cell [H/m], ``mu0 * mu_r``."""
-        return mu0 * self._mu_r
+        return mu0 * self._effective("mu")
 
     def sigma(self) -> np.ndarray:
         """Conductivity per cell [S/m]."""
-        return self._sigma.copy()
+        return self._effective("sigma")
 
     def eps_r(self) -> np.ndarray:
         """Relative permittivity per cell [dimensionless]."""
-        return self._eps_r.copy()
+        return self._effective("eps")
 
     def mu_r(self) -> np.ndarray:
-        """Relative permeability per cell [dimensionless]."""
-        return self._mu_r.copy()
+        """Relative permeability per cell [dimensionless].
+
+        Mixed harmonically by default; see the ``mix_mu`` argument of
+        :meth:`assign`, which is the knob to turn for an MQS or inductance run
+        whose flux runs *along* a staircased magnetic surface.
+        """
+        return self._effective("mu")
+
+    def coverage(self) -> np.ndarray:
+        """Fraction of each cell claimed by assigned materials [dimensionless].
+
+        Zero where nothing has been assigned (the cell is pure background), one
+        where the assignments fill the cell.  ``1 - coverage()`` is the
+        background's share, which is exactly the weight it carries in the
+        effective-medium blend.  Useful as a geometry check: a region you
+        believe is solid metal but whose coverage is 0.97 is telling you the
+        voxelisation missed a sliver.
+        """
+        return self._cov.copy()
 
     def ids(self) -> np.ndarray:
         """Dominant material id per cell, ``int32``, shape ``grid.shape_cells``.
@@ -1298,12 +1464,18 @@ class MaterialMap:
             should be used; a metal against a good insulator routinely gives
             1e18 or more, which is physics, not a bug.
         """
-        s = self._sigma[self._sigma > 0.0]
-        eps_abs = eps0 * self._eps_r
+        # Mask first, then divide: a lossless cell is the common case (vacuum
+        # background), and dividing the whole array would raise a spurious
+        # divide-by-zero RuntimeWarning -- a hard failure under np.seterr or
+        # -W error.
+        sig, eps_r = self._effective("sigma"), self._effective("eps")
+        lossy = sig > 0.0
+        s = sig[lossy]
+        eps_abs = eps0 * eps_r[lossy]
         return {
-            "eps_ratio": float(self._eps_r.max() / self._eps_r.min()),
+            "eps_ratio": float(eps_r.max() / eps_r.min()),
             "sigma_ratio": float(s.max() / s.min()) if s.size else 1.0,
-            "min_relaxation_time": (float((eps_abs / self._sigma)[self._sigma > 0].min())
+            "min_relaxation_time": (float((eps_abs / s).min())
                                     if s.size else math.inf),
         }
 

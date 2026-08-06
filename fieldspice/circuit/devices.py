@@ -62,6 +62,19 @@ that deserves the emphasis it gets here:
   overshoots backwards, and the next tangent is astronomically steep.
 * :func:`fetlim` and :func:`limvds` are the MOSFET equivalents.
 
+Limiting has a consequence the caller must honour: on an iteration where a
+device limited, the model was evaluated somewhere other than at ``x``, so
+neither a small Newton step nor a small ``G x - I`` proves convergence.  Every
+device therefore sets :attr:`Device.limited`, and the driving loop must read it::
+
+    converged = small_step and not any(d.limited for d in devices)
+
+This is not defensive decoration.  Measured on this file: with the stock SPICE
+``limvds``, two successive iterates were clamped to the *same* pair of values,
+which produced a bit-identical stamp, an exactly zero Newton step, and an
+apparently converged answer whose true KCL residual was 1.3e9 A.  Reading the
+flag turns that silent wrong answer into ten more iterations and the right one.
+
 Every nonlinear device supplies an **analytic** Jacobian.  Finite-difference
 Jacobians on an exponential device lose all their significant digits at exactly
 the bias where the device is interesting.

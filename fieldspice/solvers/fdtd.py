@@ -913,8 +913,13 @@ class FDTDSolver(TimeSteppingSolver):
         return sp.csr_matrix(S)
 
     # -- stability ---------------------------------------------------------
-    def stable_dt(self, safety: float = 0.99, method: str = "gershgorin"
-                  ) -> float:
+    EXACT_DT_MAX_EDGES = 250_000
+    """Above this many edges, ``stable_dt(method="auto")`` stops paying for the
+    Lanczos eigensolve and falls back to the Gershgorin bound.  Measured
+    single-threaded eigensolve cost on uniform vacuum grids: 0.4 s at 1.6e3
+    edges, 3.1 s at 8.6e4, 11.7 s at 2.0e5, 72 s at 6.7e5."""
+
+    def stable_dt(self, safety: float = 0.99, method: str = "auto") -> float:
         """Largest stable time step of *this* discrete system [s].
 
         The lossless leapfrog is the standard symplectic integrator for
@@ -932,17 +937,22 @@ class FDTDSolver(TimeSteppingSolver):
             running exactly at the limit is marginally stable and accumulates
             round-off.
         method
-            ``"gershgorin"`` (default) uses the Gershgorin disc bound on
-            ``lambda_max``, which is rigorous, costs one sparse row-sum, and is
-            *conservative* --- it can only under-estimate the allowed step, so
-            it can never hand back an unstable ``dt``.  Measured on uniform
-            vacuum grids it returns 0.949 / 0.927 / 0.806 of the true limit in
-            1D / 2D / 3D.  ``"exact"`` runs a Lanczos eigensolve
-            (``scipy.sparse.linalg.eigsh``) for the true spectral radius and
-            reproduces ``1/(c*sqrt(sum 1/h^2))`` to 1e-6 on a uniform grid; it
-            buys back that 5-19%, and rather more on a strongly graded mesh, but
-            it is slow (24 s on a 20^3 grid, 69 s on 40^3) so it is not the
-            default.
+            ``"exact"`` runs a Lanczos eigensolve
+            (``scipy.sparse.linalg.eigsh``) for the true spectral radius.  On
+            uniform vacuum grids it reproduces ``1/(c*sqrt(sum 1/h^2))`` to
+            1e-6 (1D, 2D) and to 1e-9 (3D).
+
+            ``"gershgorin"`` uses the Gershgorin disc bound on ``lambda_max``.
+            It is rigorous, costs one sparse row-sum, and is *conservative* ---
+            it can only under-estimate the allowed step, so it can never hand
+            back an unstable ``dt``.  Measured, it returns 0.949 / 0.927 /
+            0.806 of the true limit in 1D / 2D / 3D, i.e. it costs up to 24%
+            more steps.
+
+            ``"auto"`` (default) is ``"exact"`` up to
+            :attr:`EXACT_DT_MAX_EDGES` edges and ``"gershgorin"`` above, which
+            keeps the estimate itself from becoming the expensive part of a
+            large run.
 
         Returns
         -------
@@ -959,6 +969,9 @@ class FDTDSolver(TimeSteppingSolver):
         """
         if not 0.0 < safety <= 1.0:
             raise ValueError("safety must lie in (0, 1]")
+        if method == "auto":
+            method = ("exact" if self.grid.n_edges <= self.EXACT_DT_MAX_EDGES
+                      else "gershgorin")
         if method == "gershgorin":
             if self._lam_gersh is None:
                 S = self._sym_operator()
@@ -1173,26 +1186,25 @@ class FDTDSolver(TimeSteppingSolver):
             raise ValueError("t_end must be non-negative [s]")
 
         # --- time step ----------------------------------------------------
-        dt_limit_cheap = self.stable_dt(safety=1.0, method="gershgorin")
+        dt_limit = self.stable_dt(safety=1.0, method="auto")
         if dt is None:
-            dt = 0.99 * dt_limit_cheap
+            dt = 0.99 * dt_limit
         dt = float(dt)
         if dt <= 0.0:
             raise ValueError("dt must be positive [s]")
-        if dt > dt_limit_cheap:
-            # Gershgorin is conservative; pay for the exact spectral radius
-            # before refusing, so a legitimate step on a graded mesh is not
-            # rejected for the sake of a cheap bound.
+        if dt > dt_limit and self._lam_exact is None:
+            # "auto" fell back to the conservative Gershgorin bound. Refusing a
+            # run is a big enough decision to pay for the true spectral radius
+            # first, rather than rejecting a legitimate step for the sake of a
+            # cheap estimate.
             dt_limit = self.stable_dt(safety=1.0, method="exact")
-            if dt > dt_limit:
-                raise ValueError(
-                    f"dt = {dt:.6g} s exceeds the Courant stability limit "
-                    f"{dt_limit:.6g} s of this grid by a factor "
-                    f"{dt/dt_limit:.4g}. The explicit leapfrog would diverge "
-                    f"exponentially; use dt <= stable_dt(), coarsen the mesh, "
-                    f"or switch to a quasi-static solver (see docs A1).")
-        else:
-            dt_limit = dt_limit_cheap
+        if dt > dt_limit:
+            raise ValueError(
+                f"dt = {dt:.6g} s exceeds the Courant stability limit "
+                f"{dt_limit:.6g} s of this grid by a factor "
+                f"{dt/dt_limit:.4g}. The explicit leapfrog would diverge "
+                f"exponentially; use dt <= stable_dt(), coarsen the mesh, "
+                f"or switch to a quasi-static solver (see docs A1).")
 
         n_steps = int(np.ceil(t_end / dt)) if t_end > 0.0 else 0
 

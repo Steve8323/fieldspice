@@ -48,7 +48,7 @@ from __future__ import annotations
 import inspect
 import time
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, NamedTuple, Sequence
 
 import numpy as np
@@ -235,7 +235,8 @@ class LinearSystem:
                  *,
                  pin: bool = True,
                  maxiter: int | None = None,
-                 equilibrate: bool = True) -> None:
+                 equilibrate: bool = True,
+                 permc_spec: str | None = None) -> None:
         t0 = time.perf_counter()
         self.cfg = config or SolverConfig()
         A = sp.csr_matrix(A)
@@ -305,25 +306,55 @@ class LinearSystem:
         self.positive_diagonal = bool(np.all(dreal > 0))
         self._spd_candidate = self.symmetric and self.positive_diagonal
 
+        # -- split off decoupled 1x1 rows ----------------------------------
+        # apply_dirichlet turns every prescribed node into an identity row whose
+        # off-diagonal couplings are all zero, and pinning does the same.  Those
+        # unknowns are already solved (x_i = b_i / A_ii), so carrying them into
+        # the factorisation is pure waste: on a capacitance extraction with a
+        # grounded shield they can be a third of the matrix, and they leave that
+        # many isolated vertices in the elimination graph for the fill-reducing
+        # ordering to work around.  Row sums are compared against |diagonal|
+        # rather than structure, so explicitly-stored zeros cannot fool it.
+        # Restricted to symmetric matrices on purpose: a zero row does not imply
+        # a zero column otherwise, and splitting on the row test alone would
+        # silently drop the coupling held in the column.
+        dfull = A.diagonal()
+        if self.symmetric:
+            row_abs2 = _row_abs_sum(A)
+            solo = (row_abs2 <= np.abs(dfull)) & (dfull != 0)
+        else:
+            solo = np.zeros(n, dtype=bool)
+        self._solo = np.flatnonzero(solo)
+        self._free = np.flatnonzero(~solo)
+        self._solo_diag = dfull[self._solo]
+        # A matrix that is entirely diagonal has nothing left to factorise, so
+        # leave it whole and let the direct path handle it trivially.
+        self._split = bool(self._solo.size) and self._free.size > 0
+        if self._split:
+            A = sp.csr_matrix(A[self._free][:, self._free])
+            dreal = A.diagonal().real
+
         # -- symmetric Jacobi equilibration --------------------------------
-        # A' = D^-1/2 A D^-1/2 with D = diag(A).  Exact (it is a congruence, so
-        # symmetry and definiteness survive) and essential rather than cosmetic:
-        # apply_dirichlet writes identity rows of 1.0 into a matrix whose
-        # physical entries are ~1e-17 F, which inflates the condition number by
-        # 1e17 and makes CG useless while leaving a direct solve untouched.
-        # Equilibrating puts every diagonal at 1 and the damage disappears.
-        self._equilibrated = bool(equilibrate and self.positive_diagonal)
+        # A' = D^-1/2 A D^-1/2 with D = diag(A).  Exact (a congruence, so
+        # symmetry and definiteness survive) and not cosmetic: the entries of a
+        # capacitance matrix are ~1e-17 F while a conductance matrix in the same
+        # project spans 1e-12 to 1e8 S, and an unequilibrated Krylov solve on
+        # either is hopeless.  Reported residuals are mapped back afterwards.
+        nf = A.shape[0]
+        self._equilibrated = bool(equilibrate and np.all(dreal > 0))
         if self._equilibrated:
             self._dhalf = np.sqrt(dreal)
             self._dinv = 1.0 / self._dhalf
             S = sp.diags(self._dinv)
             A = sp.csr_matrix(S @ A @ S)
         else:
-            self._dhalf = np.ones(n)
-            self._dinv = np.ones(n)
+            self._dhalf = np.ones(nf)
+            self._dinv = np.ones(nf)
         self.A = A
+        self.n_free = nf
 
         # -- method selection ---------------------------------------------
+        n_eff = self.n_free
         want = self.cfg.linear_solver
         if want not in ("auto", "direct", "cg", "amg"):
             raise ValueError(
@@ -331,7 +362,7 @@ class LinearSystem:
                 "'auto', 'direct', 'cg', 'amg'")
         notes: list[str] = []
         if want == "auto":
-            if n <= DIRECT_MAX_UNKNOWNS:
+            if n_eff <= DIRECT_MAX_UNKNOWNS:
                 want = "direct"
             elif _pyamg() is not None:
                 want = "amg"
@@ -342,13 +373,15 @@ class LinearSystem:
             notes.append(
                 "matrix is not symmetric with a positive diagonal, so CG is "
                 "unsafe; falling back to "
-                + ("a direct factorisation" if n <= 4 * DIRECT_MAX_UNKNOWNS
+                + ("a direct factorisation" if n_eff <= 4 * DIRECT_MAX_UNKNOWNS
                    else "GMRES"))
-            want = "direct" if n <= 4 * DIRECT_MAX_UNKNOWNS else "gmres"
+            want = "direct" if n_eff <= 4 * DIRECT_MAX_UNKNOWNS else "gmres"
         if want == "amg" and _pyamg() is None:
             notes.append("pyamg not installed; using preconditioned CG")
             want = "cg"
 
+        self._permc = (permc_spec if permc_spec is not None
+                       else ("MMD_AT_PLUS_A" if self.symmetric else "COLAMD"))
         self._maxiter = int(maxiter) if maxiter is not None else None
         self._lu = None
         self._chol = None
@@ -359,7 +392,11 @@ class LinearSystem:
         self.info: dict[str, Any] = {
             "method": self.method,
             "n": n,
-            "nnz": int(A.nnz),
+            "n_factorised": int(self.n_free),
+            "n_decoupled": int(self._solo.size) if self._split else 0,
+            "permc_spec": self._permc,
+            "equilibrated": self._equilibrated,
+            "nnz": int(self.A.nnz),
             "symmetric": self.symmetric,
             "singular": self.singular,
             "pinned": (int(self._gauge) if self._gauge is not None else None),
@@ -383,10 +420,14 @@ class LinearSystem:
                     return
                 except Exception as exc:    # pragma: no cover - env dependent
                     notes.append(f"CHOLMOD failed ({exc}); using SuperLU")
-            # MMD on A+A^T is the right ordering for a structurally symmetric
-            # matrix and roughly halves the fill of COLAMD here.
-            perm = "MMD_AT_PLUS_A" if self.symmetric else "COLAMD"
-            self._lu = spla.splu(A.tocsc(), permc_spec=perm)
+            # Minimum degree on A+A^T is the right ordering for a structurally
+            # symmetric matrix: measured fill on these Laplacians is
+            # 165k vs 335k nonzeros against COLAMD at n=2197, and fill is what
+            # sets both the memory and the flop count.  Fill is a deterministic
+            # quantity; wall-clock on the build machine was not measurable (load
+            # average above 100 from concurrent jobs), so the ordering is chosen
+            # on fill and left overridable.
+            self._lu = spla.splu(A.tocsc(), permc_spec=self._permc)
             self.method = "splu"
             return
 
@@ -453,7 +494,8 @@ class LinearSystem:
                     RuntimeWarning, stacklevel=2)
         b[self.pinned] = 0.0
         nb = float(np.linalg.norm(b))
-        bs = b * self._dinv if self._equilibrated else b
+        bf = b[self._free] if self._split else b
+        bs = bf * self._dinv if self._equilibrated else bf
 
         iters = 0
         if self.method == "cholmod":                # pragma: no cover - env dep
@@ -461,7 +503,7 @@ class LinearSystem:
         elif self.method == "splu":
             xs = self._lu.solve(bs)
         else:
-            n = self.n
+            n = self.n_free
             maxiter = self._maxiter
             if maxiter is None:
                 maxiter = max(500, int(10 * np.sqrt(n)))
@@ -473,7 +515,10 @@ class LinearSystem:
             kw = {_CG_RTOL_KW: self.cfg.tol, "atol": 0.0, "maxiter": maxiter,
                   "M": self._M, "callback": _cb}
             if x0 is not None:
-                kw["x0"] = np.asarray(x0, dtype=self.A.dtype) * self._dhalf
+                g0 = np.asarray(x0, dtype=self.A.dtype)
+                if self._split:
+                    g0 = g0[self._free]
+                kw["x0"] = g0 * self._dhalf
             if self.method == "gmres":
                 xs, flag = spla.gmres(self.A, bs, restart=min(200, n), **kw)
             else:
@@ -484,11 +529,19 @@ class LinearSystem:
                     f"{self.method} returned flag {flag} after {iters} "
                     "iterations", RuntimeWarning, stacklevel=2)
 
-        x = xs * self._dinv if self._equilibrated else xs
+        xf = xs * self._dinv if self._equilibrated else xs
+        if self._split:
+            x = np.zeros(self.n, dtype=self.A.dtype)
+            x[self._free] = xf
+            # Decoupled rows are already solved exactly, no factorisation needed.
+            x[self._solo] = b[self._solo] / self._solo_diag
+        else:
+            x = xf
         # Always report the TRUE residual, never the Krylov solver's estimate:
         # a preconditioned residual can be orders of magnitude optimistic.  The
         # equilibrated residual is mapped back with D^1/2 so the number quoted
-        # refers to the system the caller actually handed in.
+        # refers to the system the caller actually handed in; the decoupled rows
+        # contribute exactly zero to it.
         res_vec = (bs - self.A @ xs) * self._dhalf
         res = float(np.linalg.norm(res_vec) / nb) if nb > 0 else 0.0
         self.info.update(iterations=iters, residual=res,
@@ -1413,7 +1466,7 @@ class NonlinearPoissonSolver(PoissonSolver):
                         "drho_dphi is the exact derivative of rho.",
                         history=hist, last_state=phi)
             phi = phi + lam * dphi
-            F, _ = Fn, None
+            F = Fn                      # already evaluated at the accepted step
             hist.append(fn)
             lams.append(lam)
             last_update = lam * big
@@ -1645,7 +1698,9 @@ def sphere_capacitance_convergence(radius: float = 1e-6,
                                    pads: Sequence[float] = (2.0, 3.0, 5.0, 9.0),
                                    cells_per_radius: int = 14,
                                    eps_r: float = 1.0,
-                                   growth: float = 1.25) -> dict[str, Any]:
+                                   growth: float = 1.25,
+                                   config: SolverConfig | None = None
+                                   ) -> dict[str, Any]:
     """Isolated-sphere capacitance versus box padding: the **A12** measurement.
 
     An isolated conductor has no return electrode, so the domain wall *is* the
@@ -1683,6 +1738,10 @@ def sphere_capacitance_convergence(radius: float = 1e-6,
         Relative permittivity of the surrounding medium.
     growth : float
         Mesh grading ratio away from the sphere surface.
+    config : SolverConfig, optional
+        Linear-solver strategy.  A 3D box is the case where a sparse direct
+        factorisation is most expensive, so ``linear_solver="amg"`` or ``"cg"``
+        is usually much faster here than the size-based default.
 
     Returns
     -------
@@ -1706,7 +1765,7 @@ def sphere_capacitance_convergence(radius: float = 1e-6,
                           dx_max=max(radius, R / 6.0), growth=growth)
         grid = RectilinearGrid(ax, ax, ax)
         eps = np.full(grid.shape_cells, eps_r * eps0)
-        ps = PoissonSolver(grid, eps)
+        ps = PoissonSolver(grid, eps, config)
         X, Y, Z = grid.node_coords()
         inside = (X ** 2 + Y ** 2 + Z ** 2) <= radius ** 2 * (1.0 + 1e-12)
         nodes = np.flatnonzero(inside.ravel())

@@ -33,6 +33,7 @@ than quietly producing an answer that is wrong by eleven orders of magnitude.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -372,31 +373,42 @@ def _widths_by_axis(grid: RectilinearGrid, kind: str = "cell"
             h = np.maximum(np.concatenate([h[:1], h]), np.concatenate([h, h[-1:]]))
         shp = [1, 1, 1]
         shp[d] = -1
-        out["xyz"[d]] = np.ascontiguousarray(
-            np.broadcast_to(h.reshape(shp), shape))
+        # A broadcast view, not a copy: these arrays are only ever read from
+        # (compared, masked, reduced), and on a million-cell grid the three
+        # copies would be tens of megabytes for nothing.
+        out["xyz"[d]] = np.broadcast_to(h.reshape(shp), shape)
     return out
 
 
 def _surface_normal_widths(grid: RectilinearGrid, cond: np.ndarray
-                           ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+                           ) -> tuple[np.ndarray, np.ndarray,
+                                      dict[str, np.ndarray], bool]:
     """Cell widths in the directions in which a conductor actually has a surface.
 
     The skin effect is an exponential decay measured *normal to a conductor
     surface*, so the mesh only has to resolve ``delta`` along axes in which the
     conductor is bounded.  A line of cells that conducts from one domain wall to
-    the other has no surface with that normal inside the domain --- with the
-    default homogeneous Neumann wall the conductor simply continues through it
-    --- so the cell size along that line cannot affect the skin profile.  A line
-    that is *not* conducting end to end contains only bounded runs of conductor,
-    so every conducting cell on it does face a surface with that normal.  Those
-    two statements are exhaustive, which is what makes the test exact rather
-    than heuristic.
+    the other has no surface with that normal *inside* the domain --- with the
+    default homogeneous Neumann wall the conductor continues through it --- so
+    the cell size along that line cannot affect the skin profile.  A line that
+    is not conducting end to end contains only bounded runs of conductor, so
+    every conducting cell on it does face a surface with that normal.  Those two
+    statements are exhaustive, which makes the classification exact rather than
+    heuristic.
 
-    This replaces an earlier rule that used the largest cell dimension outright.
+    This replaces an earlier rule that took the largest cell dimension outright.
     That rule called a transmission line meshed coarsely along its length and
-    finely across it a hard error, which is a false statement about a mesh that
-    is already far finer than required in every direction the current profile
-    actually varies in.
+    finely across it a hard error, which is a false statement about a mesh
+    already far finer than required in every direction the current profile
+    varies in.
+
+    The exception is a conductor that fills the domain in *every* resolved
+    direction, which is genuinely ambiguous: it is either an infinite slab (the
+    walls are symmetry planes, no skin profile exists) or a wire meshed right up
+    to its own surface (the walls *are* the surface and the profile must be
+    resolved).  Nothing in the mask distinguishes the two, so the function falls
+    back to the conservative largest-dimension rule and reports that it did, so
+    the caller can refuse to call the result an error.
 
     Parameters
     ----------
@@ -409,25 +421,33 @@ def _surface_normal_widths(grid: RectilinearGrid, cond: np.ndarray
     -------
     width
         Largest cell dimension among the surface-normal axes, per cell [m];
-        zero where the conductor has no surface at all.
-    has_surface
-        ``True`` in conducting cells with at least one surface-normal axis.
+        zero in cells that are not evaluated.
+    evaluated
+        ``True`` in conducting cells the criterion applies to.
     per_axis
         ``{axis_name: width}`` with ``inf`` where that axis is not a surface
         normal, so ``delta / width`` is directly a cells-per-delta count.
+    ambiguous
+        ``True`` when the fallback above was taken.
     """
     shape = grid.shape_cells
+    by_axis = _widths_by_axis(grid, "cell")
     width = np.zeros(shape)
-    has_surface = np.zeros(shape, dtype=bool)
+    evaluated = np.zeros(shape, dtype=bool)
     per_axis: dict[str, np.ndarray] = {}
-    for name, hd in _widths_by_axis(grid, "cell").items():
+    for name, hd in by_axis.items():
         d = "xyz".index(name)
         through = np.all(cond, axis=d, keepdims=True)
         rel = cond & ~through
         per_axis[name] = np.where(rel, hd, np.inf)
         width = np.where(rel, np.maximum(width, hd), width)
-        has_surface |= rel
-    return width, has_surface, per_axis
+        evaluated |= rel
+    if evaluated.any() or not cond.any():
+        return width, evaluated, per_axis, False
+    for name, hd in by_axis.items():
+        per_axis[name] = np.where(cond, hd, np.inf)
+        width = np.where(cond, np.maximum(width, hd), width)
+    return width, cond.copy(), per_axis, True
 
 
 def _max_cell_aspect_ratio(grid: RectilinearGrid) -> tuple[float, str, str]:
@@ -455,6 +475,54 @@ def _max_cell_aspect_ratio(grid: RectilinearGrid) -> tuple[float, str, str]:
             if r > best:
                 best, wide, thin = r, "xyz"[d], "xyz"[e]
     return best, wide, thin
+
+
+def _component_features(mask: np.ndarray, grid: RectilinearGrid,
+                        dims: Sequence[int]) -> tuple[list[float], int]:
+    """Largest bounded dimension of each connected conductor [m], and their count.
+
+    Connectivity is face-wise (the 6-neighbour structure), which is the same
+    notion of "one conductor" the solvers use: two cells that share only an edge
+    or a corner are not electrically joined by any edge of the Yee grid.
+
+    A component that touches both walls along an axis is infinite in that
+    direction, so that extent is excluded from *its* feature size --- but only
+    from its own, which is the whole point of doing this per component.  A
+    component that spans every resolved axis has no bounded dimension at all and
+    falls back to its largest extent.
+
+    ``scipy.ndimage`` does the labelling; SciPy is a core dependency, but if the
+    import fails the function degrades to reporting nothing, which restores the
+    union-only behaviour rather than crashing a pre-flight check.
+
+    The caller skips this entirely when no axis is spanned, because then every
+    component extent is bounded above by the union extent along the same axis
+    and the answer cannot change --- worth doing, since labelling a
+    million-cell mask costs about as much as all the other checks together.
+    """
+    try:
+        from scipy import ndimage
+    except ImportError:  # pragma: no cover - SciPy is a hard dependency
+        return [], 1
+    labels, n_comp = ndimage.label(mask)
+    if n_comp <= 1:
+        # One conductor: the per-component answer is the union answer already.
+        return [], int(n_comp)
+    nodes_all = (grid.xn, grid.yn, grid.zn)
+    out: list[float] = []
+    for box in ndimage.find_objects(labels):
+        if box is None:  # pragma: no cover - find_objects only skips empty labels
+            continue
+        extents, bounded = [], []
+        for d in dims:
+            nd = nodes_all[d]
+            lo, hi = box[d].start, box[d].stop
+            size = float(nd[hi] - nd[lo])
+            extents.append(size)
+            if lo > 0 or hi < mask.shape[d]:
+                bounded.append(size)
+        out.append(max(bounded) if bounded else max(extents))
+    return out, int(n_comp)
 
 
 def _locate(flat: int, shape: tuple[int, ...], grid: RectilinearGrid | None,
@@ -654,8 +722,10 @@ def check_skin_depth(grid: RectilinearGrid,
     Report
         ``details`` carries ``delta_min_m``, ``delta_max_m``, the number of
         conducting and under-resolved cells, the worst
-        ``cells_per_skin_depth``, ``cells_per_skin_depth_by_axis``, the worst
-        cell's index and position, and the cell size that would fix it.
+        ``min_cells_per_skin_depth``, ``cells_per_skin_depth_by_axis``, the
+        worst cell's index and position, and the cell size that would fix it.
+        The resolution keys are absent when no cell conducts at all, because
+        there is then nothing to resolve and any number would be an invention.
 
     Notes
     -----
@@ -673,7 +743,9 @@ def check_skin_depth(grid: RectilinearGrid,
     outright: see :func:`_surface_normal_widths`.  A direction in which the
     conductor runs from wall to wall has no surface inside the domain and no
     skin profile to resolve, which is the usual situation along a transmission
-    line.
+    line.  A conductor that fills the domain in every direction is ambiguous
+    (infinite slab, or a wire meshed to its own surface), so there the largest
+    dimension is used after all and the verdict is capped at ``warn``.
 
     In full-wave runs the alternative to meshing through ``delta`` is the
     surface-impedance boundary condition (A4b), which is valid in exactly the
@@ -715,8 +787,7 @@ def check_skin_depth(grid: RectilinearGrid,
         span = max(span, float(nodes[idx[-1] + 1] - nodes[idx[0]]))
     det["conductor_span_m"] = span
 
-    h, has_surface, per_axis = _surface_normal_widths(grid, cond)
-    checked = cond & has_surface
+    h, checked, per_axis, ambiguous = _surface_normal_widths(grid, cond)
     by_axis: dict[str, float] = {}
     for name, w in per_axis.items():
         sel = checked & np.isfinite(w)
@@ -725,19 +796,7 @@ def check_skin_depth(grid: RectilinearGrid,
     det["cells_per_skin_depth_by_axis"] = by_axis
     det["surface_normal_axes"] = sorted(by_axis)
     det["n_cells_with_a_surface"] = int(checked.sum())
-
-    if not checked.any():
-        det["n_under_resolved"] = 0
-        return Report(
-            "check_skin_depth", "ok",
-            f"The conducting region runs from wall to wall in every resolved "
-            f"direction, so it has no surface inside the domain: with the "
-            f"default homogeneous Neumann walls it is an infinite slab and "
-            f"there is no skin profile to resolve. delta is "
-            f"{det['delta_min_m']:.4g} to {det['delta_max_m']:.4g} m at "
-            f"{freq:.4g} Hz. If a wall was meant to be an open end rather than "
-            f"a symmetry plane, extend the domain past the conductor so its "
-            f"surface is inside it.", det, "A4a")
+    det["conductor_fills_the_domain"] = ambiguous
 
     res = np.full(grid.shape_cells, np.inf)
     res[checked] = delta[checked] / h[checked]
@@ -767,12 +826,20 @@ def check_skin_depth(grid: RectilinearGrid,
     frac = 100.0 * det["n_under_resolved"] / n_checked
     where = _loc_str(det)
     axes = ", ".join(f"{k} {v:.4g}" for k, v in sorted(by_axis.items()))
-    skipped_axes = [name for name in _widths_by_axis(grid) if name not in by_axis]
+    skipped_axes = [name for name in ("xyz"[d] for d in _resolved(grid))
+                    if name not in by_axis]
     axis_note = (f" Cells per delta by direction: {axes}."
                  + (f" Direction(s) {', '.join(skipped_axes)} carry no conductor "
                     f"surface (the conductor spans the domain there), so the cell "
                     f"size along them cannot affect the current profile and is "
-                    f"not counted." if skipped_axes else ""))
+                    f"not counted." if skipped_axes else "")
+                 + (" The conductor fills the domain in every resolved "
+                    "direction, so whether these cells face a surface at all "
+                    "depends on what the walls mean: if they are symmetry planes "
+                    "the conductor is infinite and none of this matters, and if "
+                    "they are the conductor's own surface it all does. That "
+                    "ambiguity is why this cannot be reported as an error."
+                    if ambiguous else ""))
     if worst_res >= SKIN_CELLS_PER_DELTA:
         level = "ok"
         msg = (f"Every conducting cell resolves the skin depth: the worst is "
@@ -781,9 +848,9 @@ def check_skin_depth(grid: RectilinearGrid,
                f"{det['delta_min_m']:.4g} and {det['delta_max_m']:.4g} m at "
                f"{freq:.4g} Hz.{axis_note}")
     else:
-        level = "warn" if worst_res >= 1.0 else "error"
+        level = "warn" if (worst_res >= 1.0 or ambiguous) else "error"
         sev = ("the current profile is not represented at all"
-               if level == "error" else "the AC resistance will come out low")
+               if worst_res < 1.0 else "the AC resistance will come out low")
         msg = (f"{det['n_under_resolved']} of {n_checked} conducting cells with "
                f"a surface ({frac:.1f}%) are coarser than "
                f"delta/{SKIN_CELLS_PER_DELTA:g}, so {sev}. Worst: {where} has "
@@ -860,6 +927,10 @@ def check_mesh_quality(grid: RectilinearGrid) -> Report:
         "growth_between_cells": (worst_i, worst_i + 1),
         "growth_position_m": float(nodes[worst_i + 1]),
         "max_aspect_ratio": float(aspect),
+        "aspect_axes": (wide_axis, thin_axis),
+        # Reported for provenance only: max(h)/min(h) over all resolved axes,
+        # which is a grading range rather than any cell's shape.
+        "size_range": float(grid.max_aspect_ratio()),
         "min_cell_m": float(min(float(h.min()) for h in hs)),
         "max_cell_m": float(max(float(h.max()) for h in hs)),
         "n_cells": int(grid.n_cells),
@@ -899,11 +970,13 @@ def check_mesh_quality(grid: RectilinearGrid) -> Report:
     if aspect > ASPECT_WARN:
         level = LEVELS[max(_RANK[level], _RANK["warn"])]
         parts.append(
-            f"Cell aspect ratio reaches {aspect:.4g} ({det['max_cell_m']:.4g} m "
-            f"against {det['min_cell_m']:.4g} m). That is not an accuracy "
-            f"problem on a tensor-product grid (A2), but it drives the condition "
-            f"number, so prefer config.linear_solver='direct' or 'amg' over "
-            f"plain 'cg' at this anisotropy.")
+            f"Cell aspect ratio reaches {aspect:.4g} (widest {wide_axis}-cell "
+            f"{_widths(grid)['xyz'.index(wide_axis)].max():.4g} m against "
+            f"narrowest {thin_axis}-cell "
+            f"{_widths(grid)['xyz'.index(thin_axis)].min():.4g} m). That is not "
+            f"an accuracy problem on a tensor-product grid (A2), but it drives "
+            f"the condition number, so prefer config.linear_solver='direct' or "
+            f"'amg' over plain 'cg' at this anisotropy.")
     else:
         parts.append(f"Cell aspect ratio {aspect:.4g} is benign.")
 
@@ -937,20 +1010,34 @@ def check_padding(grid: RectilinearGrid,
     Returns
     -------
     Report
-        ``details`` carries ``feature_size_m`` (the largest bounding-box
-        dimension of the conductor set), a ``gap_m`` and ``pad_ratio`` per open
-        wall, the list of flush walls, and the worst wall.
+        ``details`` carries ``feature_size_m`` (the fringing scale, see Notes),
+        a ``gap_m`` and ``pad_ratio`` per open wall, the list of flush walls, the
+        spanning axes and the worst wall.  ``n_conductor_components`` appears
+        only when some axis is spanned, since that is the only case in which the
+        conductors have to be labelled separately.
 
     Notes
     -----
     A wall the conductor *touches* is treated as intentional --- a ground plane
     that runs off the edge of the domain, or a symmetry cut --- and is reported
     but not warned about, because warning there would fire on the majority of
-    correctly-posed problems.  For the same reason, an axis along which the
-    conductor reaches *both* walls does not contribute to the feature size: in
-    that direction the structure is effectively infinite and its in-domain
-    length is an artifact of where the box was cut.  Collapsed directions are
-    skipped entirely; they are symmetry directions by construction.
+    correctly-posed problems.  For the same reason, an axis along which a
+    conductor reaches *both* walls does not contribute to that conductor's
+    feature size: in that direction the structure is effectively infinite and
+    its in-domain length is an artifact of where the box was cut.  Collapsed
+    directions are skipped entirely; they are symmetry directions by
+    construction.
+
+    That exclusion is applied **per connected conductor**, not to the union of
+    them, which matters more than it sounds.  Applied to the union, a single
+    ground plane running wall to wall in x deletes the x-extent of every signal
+    conductor above it, and a truncated microstrip cross-section --- the exact
+    case A12 exists for --- comes back ``ok`` because the only surviving length
+    is the trace *thickness*.  The feature size is therefore the largest of: the
+    union extent along each axis no conductor spans, and each individual
+    conductor's largest bounded dimension.  Keeping the union term as well is
+    what makes two neighbouring traces judged against the width of the pair
+    rather than of one trace.
     """
     mask = np.asarray(conductor_mask)
     if mask.shape != grid.shape_cells:
@@ -989,9 +1076,18 @@ def check_padding(grid: RectilinearGrid,
     # that direction (a ground plane, a long trace in a 2D cross-section), so
     # its in-domain length is an artifact of where the box was cut, not a
     # feature size that sets the fringing scale.  Judging padding against it
-    # would flag every correctly-posed transmission-line cross-section.
-    usable = {k: v for k, v in extents.items() if k not in spanning} or extents
-    feature = max(usable.values())
+    # would flag every correctly-posed transmission-line cross-section.  The
+    # exclusion is per conductor: see the Notes.
+    if spanning:
+        comp_features, n_comp = _component_features(mask, grid, dims)
+        det["n_conductor_components"] = n_comp
+        if comp_features:
+            det["largest_component_feature_m"] = max(comp_features)
+    else:
+        comp_features, n_comp = [], 1
+    union_usable = [v for k, v in extents.items() if k not in spanning]
+    feature = (max(union_usable + comp_features)
+               if (union_usable or comp_features) else max(extents.values()))
     det["feature_size_m"] = feature
     det["spanning_axes"] = spanning
     det["conductor_extent_m"] = {k: float(v) for k, v in extents.items()}
@@ -1021,10 +1117,11 @@ def check_padding(grid: RectilinearGrid,
                   f"are assumed to be shields or symmetry planes."
                   if flush else "")
     if spanning:
-        flush_note += (f" The conductor runs the full width of "
+        flush_note += (f" Some conductor runs the full width of "
                        f"{', '.join(spanning)}, so it is treated as infinite "
-                       f"there and that length is excluded from the feature "
-                       f"size.")
+                       f"there and that length is excluded from its own feature "
+                       f"size (but not from that of the other "
+                       f"{max(0, n_comp - 1)} conductor(s)).")
     if worst >= PAD_WARN:
         level = "ok"
         msg = (f"Padding is adequate: the tightest open wall, {worst_wall}, is "
@@ -1082,7 +1179,9 @@ def check_dielectric_relaxation(eps_cell: np.ndarray,
     dt
         Time step [s] the transient solver will use.
     grid
-        Optional, only used to turn the worst cell index into a position.
+        Optional.  When given, both arrays must have shape ``grid.shape_cells``
+        and the worst cell index is turned into a physical position.  Without it
+        any common shape is accepted and no position is reported.
 
     Returns
     -------
@@ -1094,23 +1193,29 @@ def check_dielectric_relaxation(eps_cell: np.ndarray,
     Raises
     ------
     ValueError
-        Shape mismatch, non-positive ``dt``, negative ``sigma``, or a
-        permittivity that looks relative rather than absolute.
+        Shape mismatch --- between the two arrays, or against ``grid`` when one
+        is given --- non-positive ``dt``, negative ``sigma``, or a permittivity
+        that looks relative rather than absolute.
     """
-    eps = np.asarray(eps_cell, dtype=float)
-    sigma = np.asarray(sigma_cell, dtype=float)
+    if grid is not None:
+        # Without this a wrong-shaped array either crashes with IndexError deep
+        # inside _locate or, worse, reports a position unravelled against the
+        # wrong shape.  Ground rule 7: raise eagerly, never coerce.
+        eps = _as_cell_array(eps_cell, grid, "eps_cell")
+        sigma = _as_cell_array(sigma_cell, grid, "sigma_cell")
+    else:
+        eps = np.asarray(eps_cell, dtype=float)
+        sigma = np.asarray(sigma_cell, dtype=float)
+        if not np.all(np.isfinite(eps)) or not np.all(np.isfinite(sigma)):
+            raise ValueError("eps_cell / sigma_cell contain non-finite values")
     if eps.shape != sigma.shape:
         raise ValueError(
             f"eps_cell {eps.shape} and sigma_cell {sigma.shape} must have the "
             f"same shape")
-    if not np.all(np.isfinite(eps)) or not np.all(np.isfinite(sigma)):
-        raise ValueError("eps_cell / sigma_cell contain non-finite values")
     if np.any(sigma < 0.0):
         raise ValueError("sigma_cell must be non-negative [S/m]")
     _require_absolute_eps(eps, "eps_cell")
-    if not np.isfinite(dt) or dt <= 0.0:
-        raise ValueError(f"dt must be a positive time in seconds, got {dt}")
-    dt = float(dt)
+    dt = _require_positive(dt, "dt", "time in seconds")
 
     cond = sigma > 0.0
     det: dict[str, Any] = {"dt_s": dt, "n_conducting_cells": int(cond.sum())}
@@ -1219,20 +1324,38 @@ def check_debye_length(doping: np.ndarray,
     Report
         ``details`` carries ``LD_min_m``, ``LD_max_m``, ``N_max_per_m3``, the
         required cell size, and --- with a grid --- the worst
-        ``cells_per_debye_length`` and its location.
+        ``min_cells_per_debye_length``,
+        ``cells_per_debye_length_by_axis``, the best-resolved direction, and the
+        worst location.
 
     Raises
     ------
     ValueError
-        Non-positive ``T``, negative doping, an ``eps`` that does not broadcast,
-        or a ``doping`` array that matches neither the node nor the cell shape
-        of the supplied grid.
+        Non-positive ``T``, non-finite doping, ``eps_r < 1``, an ``eps`` that
+        does not broadcast against ``doping``, or a ``doping`` array that
+        matches neither the node nor the cell shape of the supplied grid.  A
+        signed doping array is *not* an error: only the magnitude
+        ``|Nd - Na|`` enters the Debye length, so the sign is taken off.
+
+    Notes
+    -----
+    Unlike the skin depth, the direction the screening happens in cannot be
+    recovered from the inputs: it is set by the junctions and the gate stack,
+    not by the doping array alone (a uniformly doped MOS capacitor screens
+    normal to an oxide interface this function never sees).  The headline number
+    is therefore the *worst* resolved direction, which is the conservative
+    reading, but a mesh that resolves LD in at least one direction everywhere
+    and fails in another is capped at ``warn``: on a planar device that is the
+    normal, correct mesh (fine vertically, coarse laterally), and calling it an
+    ``error`` --- "the model is the wrong model" --- would abort a valid run
+    through :meth:`Report.raise_if_error`.  ``cells_per_debye_length_by_axis``
+    reports every direction so the caller can apply its own knowledge of the
+    geometry.
     """
     N = np.abs(np.asarray(doping, dtype=float))
     if not np.all(np.isfinite(N)):
         raise ValueError("doping contains non-finite values")
-    if not np.isfinite(T) or T <= 0.0:
-        raise ValueError(f"T must be a positive temperature in kelvin, got {T}")
+    T = _require_positive(T, "T", "temperature in kelvin")
     kind = "cell"
     if grid is not None:
         if N.shape == grid.shape_nodes:
@@ -1286,17 +1409,29 @@ def check_debye_length(doping: np.ndarray,
             f"three across a junction. Pass grid= to have that checked rather "
             f"than merely stated.", det, "A5, A7")
 
-    h = _node_max_width(grid) if kind == "node" else _cell_max_width(grid)
+    by_axis_h = _widths_by_axis(grid, kind)
+    # Pairwise rather than ufunc.reduce over the list, which would first stack
+    # the broadcast views into one real (naxes, Nx, Ny, Nz) array.
+    h = functools.reduce(np.maximum, by_axis_h.values())       # worst direction
+    h_best = functools.reduce(np.minimum, by_axis_h.values())  # best direction
     res = np.full(N.shape, np.inf)
     res[doped] = LD[doped] / h[doped]
+    res_best = np.full(N.shape, np.inf)
+    res_best[doped] = LD[doped] / h_best[doped]
     worst = int(np.argmin(np.where(doped, res, np.inf)))
     worst_res = float(res.flat[worst])
+    best_dir_res = float(np.min(np.where(doped, res_best, np.inf)))
     det["min_cells_per_debye_length"] = worst_res
+    det["best_direction_cells_per_debye_length"] = best_dir_res
+    det["cells_per_debye_length_by_axis"] = {
+        name: float(np.min(LD[doped] / wa[doped])) for name, wa in by_axis_h.items()}
     det["worst_LD_m"] = float(LD.flat[worst])
     det["worst_cell_size_m"] = float(h.flat[worst])
     det["worst_doping_per_cm3"] = float(N.flat[worst]) / 1e6
     det["n_under_resolved"] = int(np.count_nonzero(res < 1.0))
     det.update(_locate(worst, N.shape, grid, kind))
+    axes = ", ".join(f"{k} {v:.4g}"
+                     for k, v in sorted(det["cells_per_debye_length_by_axis"].items()))
 
     if worst_res >= 1.0:
         level = "ok"
@@ -1306,17 +1441,46 @@ def check_debye_length(doping: np.ndarray,
                f"{det['worst_doping_per_cm3']:.4g} cm^-3 and the cell is "
                f"{det['worst_cell_size_m']:.4g} m. LD spans "
                f"{det['LD_min_m']:.4g} to {det['LD_max_m']:.4g} m.")
+    elif best_dir_res >= 1.0:
+        # Anisotropic mesh: every doped location resolves LD along at least one
+        # axis and fails along another.  This function cannot tell which axis
+        # the screening runs along, and on a planar device (fine normal to the
+        # gate, coarse along the channel) the mesh is correct as it stands, so
+        # this can never be more than a warning.
+        level = "warn"
+        per_axis = det["cells_per_debye_length_by_axis"]
+        # The branch is decided cell by cell, so it is possible (if different
+        # locations are resolved by different axes) for no single axis to clear
+        # the threshold everywhere; name the directions generically then.
+        thin = [k for k, v in per_axis.items() if v >= 1.0]
+        fat = [k for k, v in per_axis.items() if v < 1.0]
+        good = ", ".join(thin) if thin else "its finest direction at each location"
+        bad = ", ".join(fat) if fat else "its coarsest direction at each location"
+        msg = (f"The mesh is strongly anisotropic about the Debye length: it "
+               f"resolves LD along {good} ({best_dir_res:.4g} cells "
+               f"per LD in the best direction at the worst location) but not "
+               f"along {bad} ({worst_res:.4g} cells per LD). Cells "
+               f"per LD by direction: {axes}. That is exactly the right mesh for "
+               f"a planar device whose junctions and inversion layer are normal "
+               f"to {good}, and the wrong one if any space-charge "
+               f"region varies along {bad} --- a lateral source/drain "
+               f"junction, for instance. Worst: {_loc_str(det)} has "
+               f"h = {det['worst_cell_size_m']:.4g} m against "
+               f"LD = {det['worst_LD_m']:.4g} m at N = "
+               f"{det['worst_doping_per_cm3']:.4g} cm^-3.")
     else:
-        level = "warn" if worst_res >= 0.2 else "error"
+        level = "warn" if best_dir_res >= 0.2 else "error"
         sev = ("badly under-resolved" if level == "error"
                else "marginally under-resolved")
-        msg = (f"The space-charge region is {sev}: "
+        msg = (f"The space-charge region is {sev} in every direction: "
                f"{det['n_under_resolved']} of {det['n_doped_cells']} doped "
                f"locations have cells wider than a Debye length. Worst: "
                f"{_loc_str(det)} has h = {det['worst_cell_size_m']:.4g} m "
                f"against LD = {det['worst_LD_m']:.4g} m at N = "
                f"{det['worst_doping_per_cm3']:.4g} cm^-3, i.e. "
-               f"{worst_res:.4g} cells per LD. Scharfetter-Gummel (A7) keeps the "
+               f"{worst_res:.4g} cells per LD ({best_dir_res:.4g} even in the "
+               f"best-resolved direction). Cells per LD by direction: {axes}. "
+               f"Scharfetter-Gummel (A7) keeps the "
                f"solve stable at this spacing, so it will converge and return a "
                f"smooth, wrong depletion edge: junction capacitance and "
                f"subthreshold slope are the quantities that suffer. Refine to "
@@ -1358,16 +1522,23 @@ def check_all(grid: RectilinearGrid,
         permeability [H/m], each shaped ``(Nx, Ny, Nz)``.  ``mu_cell=None``
         means ``mu0``.
     t_rise
-        Signal rise time [s].  Used for the A1 band and, when ``freq`` is
-        absent, for the skin depth via the knee frequency ``0.35 / t_rise``.
+        Signal rise time [s], converted to the knee frequency ``0.35 / t_rise``.
     freq
-        Excitation frequency [Hz].
+        Excitation frequency [Hz].  Both the A1 band and the skin depth are
+        evaluated at the **higher** of ``freq`` and the knee frequency, because
+        both must be governed by the fastest thing in the problem.  Evaluating
+        the skin depth at the lower of the two is how a 0.5-cell-per-delta mesh
+        gets reported as ``ok``: supplying more information must never make the
+        verdict weaker.
     dt
         Planned transient time step [s], for the relaxation check.
     conductor_mask
         Boolean ``(Nx, Ny, Nz)`` conductor mask for the padding check.  If it
         is not given but ``sigma_cell`` is, ``sigma_cell > conductor_sigma_min``
-        is used instead.
+        is used instead --- and if *that* selects no cell, the padding check is
+        skipped rather than warned about, since an all-insulating ``sigma_cell``
+        is a statement about the problem, not a missing input.  An explicitly
+        passed empty mask still warns.
     conductor_sigma_min
         Conductivity above which a cell counts as a conductor for the padding
         check [S/m].  Default 1e3, which sits between poly-Si (1e4) and any
@@ -1388,28 +1559,48 @@ def check_all(grid: RectilinearGrid,
     """
     reports: list[Report] = []
     skipped: dict[str, str] = {}
+    details: dict[str, Any] = {}
+
+    # Validate the scalars here rather than letting the first sub-check that
+    # happens to use one raise: which checks run depends on which arrays were
+    # supplied, so otherwise a bad t_rise could pass silently.
+    f_knee = (None if t_rise is None
+              else 0.35 / _require_positive(t_rise, "t_rise", "time in seconds"))
+    f_ac = (None if freq is None
+            else _require_positive(freq, "freq", "frequency in Hz"))
 
     reports.append(check_mesh_quality(grid))
 
-    if eps_cell is not None and (t_rise is not None or freq is not None):
+    if eps_cell is not None and (f_knee is not None or f_ac is not None):
         reports.append(check_quasistatic(grid, eps_cell, mu_cell,
                                          t_rise=t_rise, freq=freq))
     else:
         skipped["check_quasistatic"] = "needs eps_cell and one of t_rise / freq"
 
-    f_skin = freq
-    if f_skin is None and t_rise is not None:
-        f_skin = 0.35 / float(t_rise)
+    # The fastest thing in the problem governs, exactly as in check_quasistatic.
+    candidates = [f for f in (f_knee, f_ac) if f is not None]
+    f_skin = max(candidates) if candidates else None
     if sigma_cell is not None and f_skin is not None:
+        details["skin_freq_Hz"] = f_skin
+        details["skin_freq_source"] = ("t_rise knee" if f_skin == f_knee else "freq")
         reports.append(check_skin_depth(grid, sigma_cell, mu_cell, f_skin))
     else:
         skipped["check_skin_depth"] = "needs sigma_cell and one of freq / t_rise"
 
-    mask = conductor_mask
-    if mask is None and sigma_cell is not None:
-        mask = np.asarray(sigma_cell) > conductor_sigma_min
-    if mask is not None:
-        reports.append(check_padding(grid, mask))
+    if conductor_mask is not None:
+        reports.append(check_padding(grid, conductor_mask))
+    elif sigma_cell is not None:
+        derived = _as_cell_array(sigma_cell, grid, "sigma_cell") > conductor_sigma_min
+        if derived.any():
+            reports.append(check_padding(grid, derived))
+        else:
+            # A purely capacitive problem is a legitimate one, not a missing
+            # input: warning here would fail the parallel-plate reference case
+            # and would punish the caller for passing sigma_cell = 0 explicitly.
+            skipped["check_padding"] = (
+                f"no cell has sigma above conductor_sigma_min "
+                f"({conductor_sigma_min:g} S/m), so there is no conductor to "
+                f"pad around")
     else:
         skipped["check_padding"] = "needs conductor_mask or sigma_cell"
 
@@ -1426,8 +1617,9 @@ def check_all(grid: RectilinearGrid,
     else:
         skipped["check_debye_length"] = "needs doping"
 
-    rep = Report.combine(reports, check="check_all",
-                         details={"skipped": skipped} if skipped else None)
+    if skipped:
+        details["skipped"] = skipped
+    rep = Report.combine(reports, check="check_all", details=details or None)
     if skipped:
         rep.message += (" Skipped " + ", ".join(sorted(skipped))
                         + " for want of inputs.")

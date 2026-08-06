@@ -89,6 +89,13 @@ property of the integrator and not of the circuit, and does not shrink under
 ``dt`` refinement in the first few steps after the discontinuity.  Backward
 Euler is L-stable (amplification -> 0) and is the default for exactly this
 reason; ``gear2`` buys second-order accuracy back without the artifact.
+
+Measured on a 1 ns RC stepped at ``dt = 20 ns`` (``z = -20``, so the predicted
+trapezoidal factor is ``-0.818``): the error after the edge runs
+``-47.6, +39.0, -31.9, +26.1, -21.3 mV`` --- eight sign changes in eight steps,
+successive ratios ``0.819, 0.818, 0.818``, exactly the predicted factor.
+Backward Euler over the same steps runs ``-47.6, -2.27, -0.108, -0.0051 mV``:
+no sign change and a decay of ``1/(1 + dt/tau) = 0.0476`` per step.
 """
 
 from __future__ import annotations
@@ -276,12 +283,12 @@ class Netlist:
     Examples
     --------
     >>> nl = Netlist()
-    >>> nl.add_vsource("V1", "in", "0", 10.0)
-    >>> nl.add_resistor("R1", "in", "out", 1e3)
-    >>> nl.add_resistor("R2", "out", "0", 3e3)
+    >>> _ = nl.add_vsource("V1", "in", "0", 10.0)
+    >>> _ = nl.add_resistor("R1", "in", "out", 1e3)
+    >>> _ = nl.add_resistor("R2", "out", "0", 3e3)
     >>> sol = MNASolver(nl, gmin=0.0).dc()
-    >>> round(sol["out"], 12)
-    7.5
+    >>> round(sol["out"], 12), round(sol["i(V1)"], 12)
+    (7.5, -0.0025)
     """
 
     def __init__(self) -> None:
@@ -521,8 +528,8 @@ class Netlist:
             v = el.value if not callable(el.value) else "f(t)"
             lines.append(f"  {el.kind} {el.name:<8} {' '.join(el.nodes):<20} {v}")
         for d in self.devices:
-            lines.append(f"  D {getattr(d, 'name', '?'):<8} "
-                         f"{' '.join(d.nodes)}")
+            lines.append(f"  * {getattr(d, 'name', '?'):<8} "
+                         f"{' '.join(d.nodes):<20} {type(d).__name__}")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -599,11 +606,19 @@ class Netlist:
             On any unparseable or unsupported card, with the line quoted.
         """
         nl = cls()
-        for lineno, line in _logical_lines(text):
-            try:
-                nl._parse_card(line)
-            except ValueError as exc:
-                raise ValueError(f"line {lineno}: {line!r}: {exc}") from None
+        lines = _logical_lines(text)
+        # Two passes, because a deck may place ".model" after the cards that
+        # use it (real decks routinely put every model at the bottom) and a
+        # model looked up before it exists yields a device silently running on
+        # default parameters -- a wrong answer that looks completely healthy.
+        for directives in (True, False):
+            for lineno, line in lines:
+                if line.startswith(".") is not directives:
+                    continue
+                try:
+                    nl._parse_card(line)
+                except ValueError as exc:
+                    raise ValueError(f"line {lineno}: {line!r}: {exc}") from None
         return nl
 
     # -- parser internals -------------------------------------------------
@@ -709,12 +724,13 @@ class Netlist:
                 params[k.upper()] = parse_value(v)
             self.models[tok[1].lower()] = params
         elif card == ".tran":
-            if len(tok) < 3:
+            nums = [parse_value(x) for x in tok[1:] if _looks_numeric(x)]
+            if len(nums) < 2:
                 raise ValueError("expected '.tran tstep tstop [tstart [tmax]]'")
             self.analyses.append({
-                "type": "tran",
-                "tstep": parse_value(tok[1]), "tstop": parse_value(tok[2]),
-                "tstart": parse_value(tok[3]) if len(tok) > 3 else 0.0,
+                "type": "tran", "tstep": nums[0], "tstop": nums[1],
+                "tstart": nums[2] if len(nums) > 2 else 0.0,
+                "tmax": nums[3] if len(nums) > 3 else None,
                 "uic": "uic" in low})
         elif card == ".ac":
             if len(tok) < 5:
@@ -734,8 +750,15 @@ class Netlist:
                 self.ic[_canon_node(k)] = parse_value(v)
         elif card == ".title":
             self.title = line[6:].strip()
+        elif card == ".temp":
+            # Not silently ignored: a global temperature would have to rescale
+            # every junction, and the models own their own T.
+            warnings.warn(
+                f"{line!r}: a global .temp is not applied; set T on the "
+                ".model card of each device instead",
+                RuntimeWarning, stacklevel=4)
         elif card in (".end", ".ends", ".options", ".option", ".op",
-                      ".print", ".plot", ".probe", ".temp", ".width",
+                      ".print", ".plot", ".probe", ".width",
                       ".save", ".control", ".endc"):
             pass
         else:
@@ -924,12 +947,15 @@ def _make_device(preferred: str, fallback: type, name: str,
     kw: dict[str, Any] = {}
     unknown: list[str] = []
     try:
-        accepted = set(inspect.signature(cls.__init__).parameters)
+        sig = inspect.signature(cls.__init__).parameters
+        accepted = set(sig)
+        takes_any = any(p.kind is inspect.Parameter.VAR_KEYWORD
+                        for p in sig.values())
     except (TypeError, ValueError):
-        accepted = set()
+        accepted, takes_any = set(), True
     for key, val in params.items():
         target = SPICE_PARAM_ALIAS.get(str(key).upper(), str(key).lower())
-        if target in accepted or not accepted:
+        if takes_any or target in accepted:
             kw[target] = val
         elif str(key).lower() in accepted:
             kw[str(key).lower()] = val
@@ -995,10 +1021,15 @@ class _FallbackDiode:
     for ``RS``).  Units: ``IS`` [A], ``N`` dimensionless, ``T`` [K].
     """
 
+    linear = False
+    dynamic = False
+
     def __init__(self, name: str, anode: str, cathode: str,
                  **params: Any) -> None:
-        IS = _param(params, "IS", 1e-14)
-        N = _param(params, "N", 1.0)
+        # Parameter names are the post-alias (constructor) spellings that
+        # SPICE_PARAM_ALIAS produces, so IS -> isat, not the card spelling.
+        IS = _param(params, "isat", 1e-14)
+        N = _param(params, "n", 1.0)
         T = _param(params, "T", 300.0)
         area = _param(params, "area", 1.0)
         self.name = name
@@ -1066,15 +1097,20 @@ class _FallbackMOSFET:
     parsed ``M`` card run; ``circuit/devices.py`` owns the real models.
     """
 
-    def __init__(self, name: str, d: str, g: str, s: str, b: str,
+    linear = False
+    dynamic = False
+
+    def __init__(self, name: str, d: str, g: str, s: str, b: str = "0",
                  **params: Any) -> None:
         self.name = name
         self.nodes = (d, g, s, b)
-        self.vth = _param(params, "VTO", 0.7)
-        self.beta = (_param(params, "KP", 2e-5) * _param(params, "W", 1e-5)
-                     / _param(params, "L", 1e-6))
-        self.lam = _param(params, "LAMBDA", 0.0)
-        self.pol = _param(params, "POLARITY", 1.0)
+        self.vth = _param(params, "vth", 0.7)
+        self.beta = (_param(params, "kp", 2e-5) * _param(params, "w", 1e-5)
+                     / _param(params, "l", 1e-6))
+        self.lam = _param(params, "lam", 0.0)
+        pol = params.get("polarity", 1.0)
+        self.pol = (1.0 if str(pol).lower().startswith("n") else -1.0
+                    ) if isinstance(pol, str) else float(pol)
 
     def reset(self) -> None:
         return None
@@ -1156,8 +1192,11 @@ class MNASolver:
     reltol, vntol, abstol
         Newton convergence tolerances, SPICE-named: relative, absolute on node
         voltages [V], absolute on branch currents [A].
-    temperature
-        Ambient temperature [K] passed to fallback compact models.
+
+    Temperature is deliberately *not* a solver knob: every compact model
+    carries its own ``T`` [K] (set on the ``.model`` card), because a single
+    global temperature cannot describe a self-heating device and pretending
+    otherwise would silently rescale every junction in the netlist.
 
     Attributes
     ----------
@@ -1172,8 +1211,7 @@ class MNASolver:
 
     def __init__(self, netlist: Netlist, config: SolverConfig | None = None,
                  gmin: float = 1e-12, reltol: float = 1e-3,
-                 vntol: float = 1e-6, abstol: float = 1e-12,
-                 temperature: float = 300.0) -> None:
+                 vntol: float = 1e-6, abstol: float = 1e-12) -> None:
         if not isinstance(netlist, Netlist):
             raise ValueError("netlist must be a fieldspice Netlist")
         if netlist.n_nodes == 0:
@@ -1186,7 +1224,6 @@ class MNASolver:
         self.reltol = float(reltol)
         self.vntol = float(vntol)
         self.abstol = float(abstol)
-        self.T = float(temperature)
 
         self.node_names: list[str] = netlist.nodes
         self.n_nodes = len(self.node_names)
@@ -1225,12 +1262,16 @@ class MNASolver:
         self._caps = [el for el in netlist.elements if el.kind == "C"]
         self._cap_pos = {el.name: k for k, el in enumerate(self._caps)}
         self._cap_i = np.zeros(len(self._caps))
+        self._build_rhs_index()
         self._x_lin = np.zeros(self.n)          # linearisation point
-        self._hist: list[np.ndarray] = []
         self._matrix_cache: dict[Any, sp.csr_matrix] = {}
         self._lu_cache: dict[Any, Any] = {}
         self.dc_info: dict[str, Any] = {}
         self._newton_total = 0
+
+    def _log(self, level: int, msg: str) -> None:
+        if self.cfg.verbose >= level:
+            print(f"[{self.name}] {msg}", flush=True)
 
     # ------------------------------------------------------------------
     # indexing helpers
@@ -1338,48 +1379,70 @@ class MNASolver:
         self._matrix_cache[key] = A
         return A
 
+    def _build_rhs_index(self) -> None:
+        """Precompute the row indices the right-hand side touches.
+
+        The RHS is rebuilt every time step, so doing the name lookups once
+        turns the inner loop from ``O(elements)`` Python into a handful of
+        vector operations.  Ground rows land on the discarded index ``n``,
+        which is why no masking is needed anywhere below.
+        """
+        el = self.netlist.elements
+        self._vsrc = [(e, self._branch_of[e.name]) for e in el if e.kind == "V"]
+        self._isrc = [(e, self._row(e.nodes[0]), self._row(e.nodes[1]))
+                      for e in el if e.kind == "I"]
+        caps = self._caps
+        self._cap_rows = (
+            np.array([self._row(e.nodes[0]) for e in caps], dtype=np.intp),
+            np.array([self._row(e.nodes[1]) for e in caps], dtype=np.intp))
+        self._cap_C = np.array([float(e.value) for e in caps])
+        inds = [e for e in el if e.kind == "L"]
+        self._ind_rows = (
+            np.array([self._branch_of[e.name] for e in inds], dtype=np.intp),
+            np.array([self._row(e.nodes[0]) for e in inds], dtype=np.intp),
+            np.array([self._row(e.nodes[1]) for e in inds], dtype=np.intp))
+        self._ind_L = np.array([float(e.value) for e in inds])
+
     def _rhs(self, t: float, hist: Sequence[np.ndarray], dt: float | None,
              method: str, source_scale: float) -> np.ndarray:
         """Right-hand side (length n+1; the trailing ground entry is dropped)."""
         b = np.zeros(self.n + 1)
         xp = hist[0] if hist else None
         xp2 = hist[1] if len(hist) > 1 else None
-        for el in self.netlist.elements:
-            k = el.kind
-            if k == "V":
-                b[self._branch_of[el.name]] = source_scale * el.value_at(t)
-            elif k == "I":
-                a, m = self._row(el.nodes[0]), self._row(el.nodes[1])
-                i_src = source_scale * el.value_at(t)
-                b[a] -= i_src
-                b[m] += i_src
-            elif k == "C" and dt is not None:
-                a, m = self._row(el.nodes[0]), self._row(el.nodes[1])
-                idx = self._cap_pos[el.name]
-                vprev = 0.0 if xp is None else float(xp[a] - xp[m])
-                geq = _cap_geq(float(el.value), dt, method)
-                if method == "be":
-                    ieq = geq * vprev
-                elif method == "trap":
-                    ieq = geq * vprev + self._cap_i[idx]
-                else:                              # gear2
-                    vprev2 = 0.0 if xp2 is None else float(xp2[a] - xp2[m])
-                    ieq = float(el.value) * (4.0 * vprev - vprev2) / (2.0 * dt)
-                b[a] += ieq
-                b[m] -= ieq
-            elif k == "L" and dt is not None:
-                br = self._branch_of[el.name]
-                a, m = self._row(el.nodes[0]), self._row(el.nodes[1])
-                iprev = 0.0 if xp is None else float(xp[br])
-                L = float(el.value)
-                if method == "be":
-                    b[br] = -(L / dt) * iprev
-                elif method == "trap":
-                    vprev = 0.0 if xp is None else float(xp[a] - xp[m])
-                    b[br] = -(2.0 * L / dt) * iprev - vprev
-                else:                              # gear2
-                    iprev2 = 0.0 if xp2 is None else float(xp2[br])
-                    b[br] = -(L / (2.0 * dt)) * (4.0 * iprev - iprev2)
+        for el, br in self._vsrc:
+            b[br] = source_scale * el.value_at(t)
+        for el, a, m in self._isrc:
+            i_src = source_scale * el.value_at(t)
+            b[a] -= i_src
+            b[m] += i_src
+        if dt is None:
+            return b
+
+        if self._cap_C.size:
+            ca, cm = self._cap_rows
+            vprev = np.zeros(ca.size) if xp is None else xp[ca] - xp[cm]
+            if method == "gear2":
+                vprev2 = (np.zeros(ca.size) if xp2 is None
+                          else xp2[ca] - xp2[cm])
+                ieq = self._cap_C * (4.0 * vprev - vprev2) / (2.0 * dt)
+            else:
+                ieq = _cap_geq(self._cap_C, dt, method) * vprev
+                if method == "trap":
+                    ieq = ieq + self._cap_i
+            np.add.at(b, ca, ieq)
+            np.add.at(b, cm, -ieq)
+
+        if self._ind_L.size:
+            br, la, lm = self._ind_rows
+            iprev = np.zeros(br.size) if xp is None else xp[br]
+            if method == "be":
+                b[br] = -(self._ind_L / dt) * iprev
+            elif method == "trap":
+                vprev = np.zeros(br.size) if xp is None else xp[la] - xp[lm]
+                b[br] = -(2.0 * self._ind_L / dt) * iprev - vprev
+            else:                                  # gear2
+                iprev2 = np.zeros(br.size) if xp2 is None else xp2[br]
+                b[br] = -(self._ind_L / (2.0 * dt)) * (4.0 * iprev - iprev2)
         return b
 
     def stamp(self, t: float, x_prev: np.ndarray | Sequence[np.ndarray] | None = None,
@@ -1432,33 +1495,47 @@ class MNASolver:
         uses whatever history is currently stored (zeros after construction).
         """
         method = _check_method(method)
-        gmin = self.gmin if gmin is None else float(gmin)
+        hist = self._history(x_prev)
+        A, b = self._assemble(t, hist, dt, method, x,
+                              self.gmin if gmin is None else float(gmin),
+                              source_scale, need_matrix=True)
+        # Hand out a copy: the linear part is cached, and a caller such as
+        # coupling.py legitimately adds its own block to what it gets back.
+        return A.copy(), b
+
+    def _history(self, x_prev: np.ndarray | Sequence[np.ndarray] | None
+                 ) -> list[np.ndarray]:
         if x_prev is None:
-            hist: list[np.ndarray] = []
-        elif isinstance(x_prev, np.ndarray):
-            hist = [self._augment(x_prev)]
-        else:
-            hist = [self._augment(np.asarray(h, dtype=float)) for h in x_prev]
+            return []
+        if isinstance(x_prev, np.ndarray) and x_prev.ndim == 1:
+            return [self._augment(x_prev)]
+        return [self._augment(np.asarray(h, dtype=float)) for h in x_prev]
+
+    def _assemble(self, t: float, hist: Sequence[np.ndarray],
+                  dt: float | None, method: str, x: np.ndarray | None,
+                  gmin: float, source_scale: float, need_matrix: bool = True
+                  ) -> tuple[sp.csr_matrix | None, np.ndarray]:
+        """Build the system.  Internal: the matrix returned may be the cached
+        object itself, so callers must not modify it in place."""
+        b = self._rhs(t, hist, dt, method, source_scale)
+        devices = self.netlist.devices
+        if not need_matrix and not devices:
+            return None, b[: self.n]
 
         A = self._static_matrix(dt, method, gmin)
-        b = self._rhs(t, hist, dt, method, source_scale)
-
-        if self.netlist.devices:
-            xa = self._augment(self._x_lin if x is None else np.asarray(x, float))
+        if devices:
+            xa = self._augment(self._x_lin if x is None
+                               else np.asarray(x, dtype=float))
             Dm = sp.lil_matrix((self.n + 1, self.n + 1))
             xp = hist[0] if hist else self._augment(None)
-            for dev in self.netlist.devices:
+            for dev in devices:
                 _dev_call(dev, "set_time", t)
                 if dt is None:
                     dev.stamp_dc(Dm, b, xa, self.nmap)
                 else:
                     dev.stamp_tran(Dm, b, xa, xp, dt, self.nmap)
             A = A + Dm.tocsr()[: self.n, : self.n]
-        else:
-            # Hand out a copy: the linear part is cached and a caller such as
-            # coupling.py legitimately adds its own block to what it gets back.
-            A = A.copy()
-        return A.tocsr(), b[: self.n]
+        return A, b[: self.n]
 
     # ------------------------------------------------------------------
     # linear algebra
@@ -1493,6 +1570,18 @@ class MNASolver:
     # Newton
     # ------------------------------------------------------------------
     def _converged(self, x_old: np.ndarray, x_new: np.ndarray) -> bool:
+        """SPICE's convergence test: relative, with a per-quantity floor.
+
+        The floor is what makes this safe.  A device with junction limiting
+        moves the *iterate* very little while the limiter walks the junction
+        voltage up logarithmically, so a purely relative test would declare
+        victory on the second iteration with the diode still off.  Measured on
+        a 2 V/1 kohm diode clamp: iteration 2 has ``max|dx| = 5.6e-8``, which
+        passes every relative test, but the branch-current row moves by
+        5.6e-11 A against a tolerance of 1.1e-12 A (``abstol`` dominates
+        because the current is still nanoamps) and correctly forces the solver
+        onward to the true answer eight iterations later.
+        """
         d = np.abs(x_new - x_old)
         scale = np.maximum(np.abs(x_new), np.abs(x_old))
         tol = self.reltol * scale + np.where(self._is_node_row,
@@ -1511,10 +1600,15 @@ class MNASolver:
         for dev in self.netlist.devices:
             _dev_call(dev, "reset_state") or _dev_call(dev, "reset")
         x = np.asarray(x0, dtype=float).copy()
+        hist = [self._augment(h) for h in hist]   # ground rail for every read
         key = (dt, method, gmin) if linear else None
         for it in range(1, int(self.cfg.max_newton) + 1):
-            A, b = self.stamp(t, hist or None, dt, method, x=x, gmin=gmin,
-                              source_scale=source_scale)
+            # Once the factorisation for this (dt, method, gmin) is cached and
+            # nothing in the matrix depends on x, only the right-hand side has
+            # to be rebuilt -- the whole point of a fixed time step.
+            A, b = self._assemble(
+                t, hist, dt, method, x, gmin, source_scale,
+                need_matrix=key is None or key not in self._lu_cache)
             xn = self._solve(A, b, cache_key=key)
             self._newton_total += 1
             if not np.all(np.isfinite(xn)):
@@ -1522,6 +1616,8 @@ class MNASolver:
             if linear:
                 return xn, it, True
             done = self._converged(x, xn)
+            self._log(2, f"t={t:.6g} newton {it}: "
+                         f"max|dx| = {np.max(np.abs(xn - x)):.3e}")
             x = xn
             if done and it >= 2:
                 return x, it, True
@@ -1568,21 +1664,30 @@ class MNASolver:
 
         if "gmin" in want:
             tried.append("gmin")
-            # Start hard.  SPICE3 ramps from gmin*1e10 (about 1e-2 S), which is
-            # too weak to hold a node below a junction's turn-on when the
-            # source resistance is kilohms: the first iterate lands at half the
-            # supply and the exponential explodes.  1 S clamps every node to
-            # millivolts against any sane series resistance, and the twelve
-            # decades back down cost twelve cheap solves.
-            g = max(1.0, self.gmin * 1e12)
-            xs, nstage, ok_all = x0.copy(), 0, True
-            while g > self.gmin:
-                xs, it, ok = self._newton(t, xs, None, "be", (), g, 1.0)
+            # Start hard and step adaptively in log10(g).  Two lessons paid for
+            # in measurements: (i) SPICE3's start of gmin*1e10 (about 1e-2 S)
+            # is too weak to hold a node below a junction's turn-on behind a
+            # kilohm, so the first iterate lands at half the supply and an
+            # unlimited exponential explodes; (ii) fixed decade steps fail
+            # anyway right at turn-on, where one decade of shunt moves the node
+            # by hundreds of millivolts -- 400 mV is 17 e-foldings of diode
+            # current, far outside Newton's basin.  Backing the decrement off
+            # on failure is what makes this stage actually work.
+            lg = math.log10(max(1.0, self.gmin * 1e12))
+            lg_end = math.log10(self.gmin) if self.gmin > 0 else -14.0
+            xs, nstage, dec, ok_all = x0.copy(), 0, 1.0, True
+            while lg > lg_end:
+                trial = max(lg_end, lg - dec)
+                xt, it, ok = self._newton(t, xs, None, "be", (), 10.0 ** trial,
+                                          1.0)
                 nstage += 1
-                if not ok:
-                    ok_all = False
-                    break
-                g /= 10.0
+                if ok:
+                    lg, xs, dec = trial, xt, min(1.0, dec * 1.5)
+                else:
+                    dec *= 0.25
+                    if dec < 1e-3 or nstage > 200:
+                        ok_all = False
+                        break
             if ok_all:
                 x, it, ok = self._newton(t, xs, None, "be", (), self.gmin, 1.0)
                 if ok:
@@ -1643,6 +1748,7 @@ class MNASolver:
             :attr:`dc_info`.
         """
         x = self.operating_point(t, homotopy)
+        self._log(1, f"dc: {self.dc_info}")
         out: dict[str, float] = {"0": 0.0}
         for nm, i in self.node_map.items():
             if i >= 0:
@@ -1714,7 +1820,10 @@ class MNASolver:
         Parameters
         ----------
         t_end, t_start
-            Time window [s].
+            Time window [s].  The step count is ``ceil((t_end - t_start)/dt)``,
+            matching :meth:`fieldspice.solvers.base.TimeSteppingSolver._time_points`,
+            so if ``dt`` does not divide the span the final sample lands just
+            past ``t_end`` rather than just short of it.
         dt
             Step size [s].  Fixed: this solver does not do local truncation
             error control, so choose ``dt`` from the fastest edge you care
@@ -1785,7 +1894,6 @@ class MNASolver:
 
         self._cap_i = np.zeros(len(self._caps))
         hist = [x.copy()]
-        keep = [0]
         xs = [x.copy()]
         ts = [t_start]
         nonconv = 0
@@ -1814,13 +1922,15 @@ class MNASolver:
             if k % store_every == 0 or k == nsteps:
                 xs.append(x.copy())
                 ts.append(t)
-                keep.append(k)
 
         arr = np.asarray(xs)
         res = Result(grid=None, t=np.asarray(ts))
         res.fields["x"] = arr
         self._fill_scalars(res, arr)
         self._fill_terminals(res, arr, np.asarray(ts))
+        self._log(1, f"transient: {nsteps} steps of {dt:.4g} s, method "
+                     f"{method}, {self._newton_total} linear solves, "
+                     f"{nonconv} non-converged")
         res.meta.update(
             solver=self.name, analysis="transient",
             assumptions=list(self.assumptions), method=method, dt=dt,
@@ -1836,11 +1946,14 @@ class MNASolver:
         """Small-signal AC analysis: one complex solve per frequency.
 
         Nonlinear devices are linearised about the DC operating point.  A
-        device contributes its DC conductance automatically (the companion
-        stamp *is* the small-signal conductance at the operating point); it
-        contributes small-signal *capacitance* only if it implements the
-        optional ``stamp_ac`` hook, and ``meta["ac_device_reactance"]`` records
-        whether any device did.
+        device that implements ``stamp_ac`` supplies its complete small-signal
+        admittance there (``gd + j*omega*Cj`` for a diode) and is stamped only
+        that way; one that does not contributes the conductance of its DC
+        companion stamp, which is the correct small-signal conductance but
+        carries no charge storage.  Which devices went down which path is
+        recorded in ``meta["ac_stamped_devices"]`` and
+        ``meta["ac_dc_only_devices"]``, so a missing junction capacitance is
+        visible in the result rather than hidden in it.
 
         Parameters
         ----------
@@ -1897,6 +2010,55 @@ class MNASolver:
                         ac_default_drive=not declared,
                         wall_time=time.perf_counter() - t0)
         return res
+
+    def run(self, analysis: Mapping[str, Any] | None = None) -> Result:
+        """Run an analysis directive parsed from a SPICE deck.
+
+        Parameters
+        ----------
+        analysis
+            One entry of ``netlist.analyses``.  Defaults to the first one.
+
+        Returns
+        -------
+        Result
+            From :meth:`transient`, :meth:`ac` or :meth:`dc_sweep` as the
+            directive requires.
+
+        Raises
+        ------
+        ValueError
+            If the netlist carries no directive, or the directive type is not
+            one this solver runs.
+        """
+        if analysis is None:
+            if not self.netlist.analyses:
+                raise ValueError("netlist has no analysis directive; "
+                                 "call transient(), ac() or dc_sweep()")
+            analysis = self.netlist.analyses[0]
+        kind = analysis.get("type")
+        if kind == "tran":
+            return self.transient(analysis["tstop"], analysis["tstep"],
+                                  t_start=analysis.get("tstart", 0.0),
+                                  uic=bool(analysis.get("uic", False)))
+        if kind == "ac":
+            n = max(1, int(analysis["points"]))
+            f0, f1 = float(analysis["fstart"]), float(analysis["fstop"])
+            spacing = str(analysis.get("spacing", "dec")).lower()
+            if spacing == "lin":
+                freqs = np.linspace(f0, f1, n)
+            else:
+                per = n if spacing == "dec" else n / np.log10(2.0)
+                count = int(round(per * np.log10(f1 / f0))) + 1
+                freqs = np.logspace(np.log10(f0), np.log10(f1), max(count, 2))
+            return self.ac(freqs)
+        if kind == "dc":
+            start, stop = float(analysis["start"]), float(analysis["stop"])
+            incr = float(analysis["incr"]) or 1.0
+            npts = int(round((stop - start) / incr)) + 1
+            return self.dc_sweep(analysis["source"],
+                                 start + incr * np.arange(max(npts, 1)))
+        raise ValueError(f"cannot run analysis of type {kind!r}")
 
     # ------------------------------------------------------------------
     # internals for the analyses above
@@ -2040,14 +2202,39 @@ class MNASolver:
                 aux.add_vcvs(el.name, *el.nodes, el.value)
             elif el.kind == "G":
                 aux.add_vccs(el.name, *el.nodes, el.value)
+        forced_branches: dict[str, float] = {}
         for dev in self.netlist.devices:
+            # A two-terminal dynamic device gets the same treatment as a native
+            # C or L.  Which source replaces it follows from whether it owns a
+            # branch-current unknown: an inductor-like device does (its state
+            # is a current), a capacitor-like one does not (its state is a
+            # voltage).  Anything else keeps its operating-point state, and
+            # says so.
+            ic = getattr(dev, "ic", None)
+            branches = _extra_unknowns(dev)
+            if (getattr(dev, "dynamic", False) and len(dev.nodes) == 2
+                    and ic is not None):
+                if branches:
+                    aux.add_isource(dev.name, dev.nodes[0], dev.nodes[1],
+                                    float(ic))
+                    forced_branches[branches[0]] = float(ic)
+                else:
+                    aux.add_vsource(dev.name, dev.nodes[0], dev.nodes[1],
+                                    float(ic))
+                continue
+            if getattr(dev, "dynamic", False):
+                warnings.warn(
+                    f"uic: device {dev.name!r} stores state but is not a "
+                    "two-terminal element with an 'ic'; its initial state "
+                    "comes from the operating point",
+                    RuntimeWarning, stacklevel=3)
             aux.devices.append(dev)
         for nd in self.netlist.nodes:          # keep every node alive
             aux._register(nd)
 
         sub = MNASolver(aux, self.cfg, gmin=max(self.gmin, 1e-12),
                         reltol=self.reltol, vntol=self.vntol,
-                        abstol=self.abstol, temperature=self.T)
+                        abstol=self.abstol)
         xa = sub.operating_point(t)
 
         x = np.zeros(self.n)
@@ -2060,6 +2247,8 @@ class MNASolver:
         for el in self.netlist.elements:        # inductor currents are given
             if el.kind == "L":
                 x[self._branch_of[el.name]] = 0.0 if el.ic is None else float(el.ic)
+        for key, val in forced_branches.items():
+            x[self._branch_of[key]] = val
         for nd, v in self.netlist.ic.items():   # .ic overrides
             if nd in self.node_map and self.node_map[nd] >= 0:
                 x[self.node_map[nd]] = float(v)
@@ -2071,14 +2260,13 @@ class MNASolver:
         if not self._caps:
             return
         xa, xm = self._augment(x), self._augment(xprev)
-        for idx, el in enumerate(self._caps):
-            a, m = self.nmap[el.nodes[0]], self.nmap[el.nodes[1]]
-            dv = float(xa[a] - xa[m]) - float(xm[a] - xm[m])
-            geq = _cap_geq(float(el.value), dt, method)
-            if method == "trap":
-                self._cap_i[idx] = geq * dv - self._cap_i[idx]
-            else:
-                self._cap_i[idx] = geq * dv
+        ca, cm = self._cap_rows
+        dv = (xa[ca] - xa[cm]) - (xm[ca] - xm[cm])
+        geq = _cap_geq(self._cap_C, dt, method)
+        if method == "trap":
+            self._cap_i = geq * dv - self._cap_i
+        else:
+            self._cap_i = geq * dv
 
     def _fill_scalars(self, res: Result, xs: np.ndarray) -> None:
         for nm, i in self.node_map.items():

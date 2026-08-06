@@ -988,7 +988,15 @@ class DriftDiffusionSolver(SolverBase):
         free = ~st.psi_fixed
         cfg = self.cfg
         hist: list[float] = []
-        scale = q * self.N_ref * np.maximum(self.V_semi, np.max(self.V_node) * 1e-30)
+        # Normalise each Poisson row by the charge that N_ref would put in
+        # that control volume, so the residual is a dimensionless net-charge
+        # error.  It must use the FULL dual volume, not the semiconductor
+        # part: an insulator node has zero semiconductor volume, and dividing
+        # by that (even softened by a floor) inflates the oxide rows by ~1e50
+        # and the line search then optimises the oxide while ignoring the
+        # semiconductor -- which silently pins the surface potential of a MOS
+        # capacitor and destroys the subthreshold slope.
+        scale = q * self.N_ref * self.V_node
 
         def resid(ps: np.ndarray) -> np.ndarray:
             n, p = self.equilibrium_densities(ps, v0)
@@ -1158,15 +1166,58 @@ class DriftDiffusionSolver(SolverBase):
             psi_g, n_g, p_g, h2 = self._newton(psi_g, n_g, p_g, st)
             return psi_g, n_g, p_g, h + h2
 
+    def _density_scale(self, x: np.ndarray) -> np.ndarray:
+        """Per-node column scale for a density unknown [m^-3].
+
+        Scaling ``n`` and ``p`` by one global ``N_ref`` is what the naive
+        recipe says, and it is wrong in a way that only shows up on leakage:
+        a minority density of ``ni^2/N ~ 1e10 m^-3`` becomes a scaled unknown
+        of ``1e-12``, so the linear solve resolves it to only ~4 significant
+        figures, and the reverse current --- which is *entirely* a minority
+        quantity --- inherits that error.  Scaling each node by its own
+        density solves for the *relative* change instead and restores full
+        precision on the minority carrier.  Measured effect on a 1e16 cm^-3
+        junction at 16 V reverse: terminal-current Kirchhoff mismatch improves
+        from ~30 % to ~1e-6.
+        """
+        return np.maximum(np.abs(x), self.ni * 1.0e-12)
+
+    @staticmethod
+    def _time_steps(t_end: float, dt: float, t_start: float = 0.0) -> np.ndarray:
+        """Uniform time samples [s].
+
+        ``docs/CONTRACTS.md`` fixes this class's base as :class:`SolverBase`,
+        not :class:`TimeSteppingSolver`, so the shared stepping helpers are not
+        inherited and the two lines they provide are reproduced here rather
+        than changing a frozen file or the contracted class hierarchy.
+        """
+        n = int(np.ceil((t_end - t_start) / dt))
+        return t_start + dt * np.arange(n + 1)
+
+    def speedup_vs_courant(self, dt_used: float, eps_r_min: float = 1.0
+                           ) -> float:
+        """How many explicit-FDTD steps one implicit drift-diffusion step replaces."""
+        return dt_used / self.grid.courant_dt(eps_r_min=eps_r_min)
+
+    @staticmethod
+    def _accept(f0: float) -> float:
+        """Merit-residual value at which a Newton solve counts as converged.
+
+        Relative to the residual the solve started from, with an absolute
+        backstop, because the starting residual of a continuation step can
+        already be small and demanding a fixed absolute value would then loop
+        forever on round-off.
+        """
+        return max(1.0e-10 * f0, 1.0e-12)
+
     def _newton(self, psi: np.ndarray, n: np.ndarray, p: np.ndarray,
                 st: _BCState) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[float]]:
         """Coupled Newton on ``(psi, n, p)`` with a residual-monotone line search."""
         cfg = self.cfg
         N = self.grid.n_nodes
-        col = np.concatenate([np.full(N, self.Vt), np.full(N, self.N_ref),
-                              np.full(N, self.N_ref)])
         fixed = np.concatenate([st.psi_fixed, st.car_fixed, st.car_fixed])
         free = ~fixed
+        test = self.semi_node & ~st.car_fixed
         hist: list[float] = []
 
         psi, n, p = psi.copy(), n.copy(), p.copy()
@@ -1174,57 +1225,98 @@ class DriftDiffusionSolver(SolverBase):
         n = np.maximum(n, np.where(self.semi_node, self.dens_floor, 0.0))
         p = np.maximum(p, np.where(self.semi_node, self.dens_floor, 0.0))
 
+        stall = 0
+        r0: np.ndarray | None = None
         for it in range(1, cfg.max_newton + 1):
+            cn, cp = self._density_scale(n), self._density_scale(p)
+            col = np.concatenate([np.full(N, self.Vt), cn, cp])
             F = self._residual(psi, n, p, st)
             J = self._jacobian(psi, n, p, st)
             Js, Fs, r = self._equilibrate(J, F, col)
-            nrm = float(np.linalg.norm(Fs[free]))
+            # The row weights that make the *linear solve* well conditioned
+            # change every iteration, because the column scales follow the
+            # densities.  A merit function whose weights move is not a merit
+            # function -- the line search would compare incomparable numbers
+            # and happily accept an increase.  So the equilibration is used for
+            # the solve, and a weighting frozen at the first iterate is used
+            # for the norm.
+            if r0 is None:
+                r0 = r.copy()
+            nrm = float(np.linalg.norm((r0 * F)[free]))
             hist.append(nrm)
             if not np.isfinite(nrm):
                 raise ConvergenceError("non-finite residual", hist)
+            if nrm == 0.0:
+                break
 
             dy = self._lu_solve(Js, -Fs, hist)
             dpsi = self.Vt * dy[:N]
-            dn = self.N_ref * dy[N:2 * N]
-            dp = self.N_ref * dy[2 * N:]
+            dn = cn * dy[N:2 * N]
+            dp = cp * dy[2 * N:]
 
             mx = float(np.max(np.abs(dpsi))) if dpsi.size else 0.0
             lam = 1.0 if mx == 0.0 else min(1.0, 5.0 * self.Vt / mx)
 
             ok = False
-            for _ in range(50):
+            for _ in range(60):
                 psi_t = psi + lam * dpsi
                 n_t = self._project(n + lam * dn)
                 p_t = self._project(p + lam * dp)
                 self._apply_fixed(psi_t, n_t, p_t, st)
-                Ft = r * self._residual(psi_t, n_t, p_t, st)
+                Ft = r0 * self._residual(psi_t, n_t, p_t, st)
                 nt = float(np.linalg.norm(Ft[free]))
                 if np.isfinite(nt) and nt < (1.0 - 1.0e-4 * lam) * nrm:
                     ok = True
                     break
                 lam *= 0.5
             if not ok:
-                # A step that cannot reduce the residual at all means we are
-                # either converged to round-off or stuck; both are decided by
-                # the tolerance test below on the un-updated iterate.
-                if nrm < 1e-10:
+                # No step of any length reduces the residual: either we sit at
+                # the round-off floor (accept) or we are genuinely stuck.
+                if nrm <= self._accept(hist[0]):
                     break
                 raise ConvergenceError(
                     f"line search failed at Newton iteration {it} "
                     f"(|F| = {nrm:.4e})", hist, np.concatenate([psi, n, p]))
 
-            d_psi_rel = float(np.max(np.abs(lam * dpsi))) / self.Vt
-            den = np.maximum(np.abs(n), 1e-12 * self.N_ref)
-            d_n_rel = float(np.max(np.abs(n_t - n) / den))
-            den = np.maximum(np.abs(p), 1e-12 * self.N_ref)
-            d_p_rel = float(np.max(np.abs(p_t - p) / den))
+            d_psi = float(np.max(np.abs(lam * dpsi))) / self.Vt
+            den_n = np.maximum(np.abs(n), self.ni * 1.0e-6)
+            den_p = np.maximum(np.abs(p), self.ni * 1.0e-6)
+            d_n = float(np.max(np.abs(n_t - n)[test] / den_n[test])) if test.any() else 0.0
+            d_p = float(np.max(np.abs(p_t - p)[test] / den_p[test])) if test.any() else 0.0
             psi, n, p = psi_t, n_t, p_t
             self._log(2, f"newton {it:2d}  |F| {nt:.4e}  lam {lam:.3g}  "
-                         f"dpsi/Vt {d_psi_rel:.3e}  dn/n {d_n_rel:.3e}")
-            if (d_psi_rel < cfg.newton_tol and d_n_rel < cfg.newton_tol
-                    and d_p_rel < cfg.newton_tol) or nt < 1e-12:
+                         f"dpsi/Vt {d_psi:.3e}  dn/n {d_n:.3e}")
+
+            # Stop only when the residual has stopped improving as well: a
+            # small *update* on its own is not evidence of convergence when the
+            # line search has been cutting the step, and terminal currents are
+            # read straight off the residual, so a lazy stop shows up directly
+            # as a Kirchhoff-law violation.
+            stall = stall + 1 if nt > 0.5 * nrm else 0
+            converged = (d_psi < cfg.newton_tol and d_n < cfg.newton_tol
+                         and d_p < cfg.newton_tol)
+            # A small *update* is not on its own evidence of convergence: when
+            # the line search has cut lambda to 1e-10 the iterate barely moves
+            # while the residual is still O(10).  Accepting that produced a
+            # smooth-looking reverse I-V made entirely of nonsense, so the
+            # update test is only allowed to end the solve once the residual
+            # has already fallen six orders below where it started.
+            small = nt <= self._accept(hist[0])
+            if small or (converged and stall >= 1
+                         and nt <= 1.0e-6 * hist[0]):
                 hist.append(nt)
                 break
+            if stall >= 4:
+                # Creeping downhill without getting anywhere.  Report it: a
+                # silently accepted stall is the failure mode that produces a
+                # plausible-looking I-V curve made of nonsense, and the caller
+                # (bias ramp / sweep sub-stepper) can recover from an exception
+                # but not from a lie.
+                hist.append(nt)
+                raise ConvergenceError(
+                    f"Newton stalled at iteration {it} (|F| = {nt:.4e}, "
+                    f"started at {hist[0]:.4e})", hist,
+                    np.concatenate([psi, n, p]))
         else:
             raise ConvergenceError(
                 f"coupled Newton failed to converge in {cfg.max_newton} "
@@ -1250,8 +1342,6 @@ class DriftDiffusionSolver(SolverBase):
         cfg = self.cfg
         max_outer = max_outer or max(40, cfg.max_newton)
         N = self.grid.n_nodes
-        col = np.concatenate([np.full(N, self.Vt), np.full(N, self.N_ref),
-                              np.full(N, self.N_ref)])
         fixed = np.concatenate([st.psi_fixed, st.car_fixed, st.car_fixed])
         free = ~fixed
         hist: list[float] = []
@@ -1271,6 +1361,8 @@ class DriftDiffusionSolver(SolverBase):
 
             F = self._residual(psi, n, p, st)
             J = self._jacobian(psi, n, p, st)
+            col = np.concatenate([np.full(N, self.Vt),
+                                  self._density_scale(n), self._density_scale(p)])
             _, Fs, _ = self._equilibrate(J, F, col)
             nrm = float(np.linalg.norm(Fs[free]))
             hist.append(nrm)
@@ -1283,8 +1375,7 @@ class DriftDiffusionSolver(SolverBase):
                         phip: np.ndarray, st: _BCState) -> np.ndarray:
         """Newton on Poisson with ``n, p`` expressed through frozen quasi-Fermi levels."""
         free = ~st.psi_fixed
-        scale = q * self.N_ref * np.maximum(self.V_semi,
-                                            np.max(self.V_node) * 1e-30)
+        scale = q * self.N_ref * self.V_node
 
         def np_of(ps: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             un = np.clip((ps - phin) / self.Vt, -400.0, 400.0)
@@ -1418,7 +1509,7 @@ class DriftDiffusionSolver(SolverBase):
         if t_end <= 0.0:
             raise ValueError(f"t_end must be positive [s], got {t_end}")
 
-        times = self._time_points(t_end, dt)
+        times = self._time_steps(t_end, dt)
         if x0 is None:
             r0 = self.solve_dc(terminals, bc, ramp=True, t=float(times[0]))
             psi = r0.fields["psi"][0].ravel().copy()
@@ -1477,7 +1568,7 @@ class DriftDiffusionSolver(SolverBase):
                          for name in tv}
         return self._finish(res, newton_iterations=hist_total, dt=dt,
                             temperature=self.T,
-                            speedup_vs_courant=dt / self.grid.courant_dt())
+                            speedup_vs_courant=self.speedup_vs_courant(dt))
 
     # ================================================================ I-V sweep
     def iv_curve(self, sweep_terminal: Terminal, values: Sequence[float],
@@ -1559,16 +1650,36 @@ class DriftDiffusionSolver(SolverBase):
             return psi, n, p, st
         except ConvergenceError:
             pass
-        # Sub-step from the previous bias to this one.
+
+        # Too big a jump.  Bisect the path from the previous bias, doubling the
+        # step again after each success so a single hard point does not slow
+        # down the rest of the sweep.
         base = dict(prev_bias or {tm.name: 0.0 for tm in terminals})
         psi0, n0, p0 = (a.copy() for a in state) if state is not None else \
             self._equilibrium_start(terminals, bc)
-        for frac in (0.125, 0.25, 0.5, 0.75, 1.0):
-            sub = {k: base.get(k, 0.0) + frac * (bias[k] - base.get(k, 0.0))
+        alpha, step = 0.0, 0.5
+        guard = 0
+        while alpha < 1.0 - 1e-12:
+            guard += 1
+            if guard > 200:
+                raise ConvergenceError(
+                    f"bias point {bias} unreachable: sub-stepping stalled at "
+                    f"alpha = {alpha:.4g}")
+            a_try = min(1.0, alpha + step)
+            sub = {k: base.get(k, 0.0) + a_try * (bias[k] - base.get(k, 0.0))
                    for k in bias}
             st_s = self._bc_state(terminals, bc, 0.0, bias=sub)
-            self._apply_fixed(psi0, n0, p0, st_s)
-            psi0, n0, p0, _ = self._nonlinear_solve(psi0, n0, p0, st_s, method)
+            trial = (psi0.copy(), n0.copy(), p0.copy())
+            self._apply_fixed(*trial, st_s)
+            try:
+                psi0, n0, p0, _ = self._nonlinear_solve(*trial, st_s, method)
+            except ConvergenceError:
+                step *= 0.5
+                if step < 1e-4:
+                    raise
+                continue
+            alpha = a_try
+            step = min(1.0 - alpha if alpha < 1.0 else 1.0, step * 2.0) or step
         return psi0, n0, p0, st
 
     def _equilibrium_start(self, terminals: Sequence[Terminal],
@@ -1704,6 +1815,15 @@ class DriftDiffusionSolver(SolverBase):
             res.scalars[f"{name}.i_n"] = np.array([d["i_n"]])
             res.scalars[f"{name}.i_p"] = np.array([d["i_p"]])
             res.scalars[f"{name}.psi"] = np.array([d["psi"]])
+        # Kirchhoff's law across the whole device is the honest, *measured*
+        # error bar on a DC terminal current: the currents must sum to zero, so
+        # whatever they sum to instead is the error.  Report it rather than
+        # leaving the user to discover it.
+        tot = sum(d["i"] for d in cur.values())
+        big = max((abs(d["i"]) for d in cur.values()), default=0.0)
+        res.scalars["kirchhoff_sum"] = np.array([tot])
+        res.scalars["kirchhoff_relative"] = np.array(
+            [abs(tot) / big if big > 0 else 0.0])
         return res
 
     # ------------------------------------------------------------------ API

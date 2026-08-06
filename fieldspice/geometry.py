@@ -143,10 +143,22 @@ def _bbox_arrays(bb: BBox) -> tuple[np.ndarray, np.ndarray]:
 class Shape(ABC):
     """An implicit solid: a membership test plus a conservative bounding box.
 
-    Subclasses implement :meth:`_contains` (vectorised, may return an array of
-    any shape that broadcasts against the inputs) and :meth:`bbox`.  The public
-    :meth:`contains` validates the arguments and normalises the result to the
-    full broadcast shape, so every shape in the library behaves identically.
+    A subclass must implement :meth:`bbox` and **either** :meth:`_contains`
+    **or** :meth:`contains`; overriding neither is a :class:`TypeError` at class
+    definition time.
+
+    * :meth:`_contains` is the cheap override point used by every primitive
+      here: it receives validated float arrays and may return an array of any
+      shape that broadcasts against them, so a slab need not materialise the
+      coordinates it ignores.  The CSG combinators call it directly.
+    * :meth:`contains` is the interface named in ``docs/CONTRACTS.md``.
+      Overriding it alone also works --- the default :meth:`_contains`
+      delegates to it --- at the cost of re-validating the coordinates on every
+      CSG evaluation.
+
+    The public :meth:`contains` validates the arguments and normalises the
+    result to the full broadcast shape, so every shape in the library behaves
+    identically whichever override a subclass chose.
 
     Notes
     -----
@@ -156,11 +168,29 @@ class Shape(ABC):
     the only cost is speed.
     """
 
+    def __init_subclass__(cls, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+        # Catch the "implemented neither" case here rather than letting the
+        # default implementations recurse into each other at call time.  A
+        # subclass that leaves bbox abstract is still abstract, so defer to
+        # whichever concrete class eventually inherits from it.
+        if getattr(cls.bbox, "__isabstractmethod__", False):
+            return
+        if (cls._contains is Shape._contains
+                and cls.contains is Shape.contains):
+            raise TypeError(
+                f"{cls.__name__} must override contains() or _contains(); "
+                "see fieldspice.geometry.Shape")
+
     # -- interface ---------------------------------------------------------
-    @abstractmethod
     def _contains(self, x: np.ndarray, y: np.ndarray,
                   z: np.ndarray) -> np.ndarray:
-        """Vectorised membership test on validated float coordinate arrays."""
+        """Vectorised membership test on validated float coordinate arrays.
+
+        The default delegates to :meth:`contains`, which is what makes a
+        subclass that only overrides the public method work everywhere.
+        """
+        return self.contains(x, y, z)
 
     @abstractmethod
     def bbox(self) -> BBox:
@@ -451,6 +481,7 @@ class Box(Shape):
                  hi: Sequence[float] | None = None):
         by_corner = lo is not None or hi is not None
         by_center = center is not None or size is not None
+        c: np.ndarray | None = None
         if by_corner and by_center:
             raise ValueError("give either center/size or lo/hi, not both")
         if by_corner:
@@ -479,11 +510,39 @@ class Box(Shape):
             raise ValueError(f"box must have positive extent, got lo={lo_a}, hi={hi_a}")
         self.lo = lo_a
         self.hi = hi_a
+        # Kept so that center/size construction round-trips through .center in a
+        # direction that is unbounded on both sides, where lo and hi no longer
+        # carry the information.
+        self._center_given: np.ndarray | None = c
 
     @property
     def center(self) -> np.ndarray:
-        """Centre [m] (infinite for an unbounded direction)."""
-        return 0.5 * (self.lo + self.hi)
+        """Centre [m], componentwise.
+
+        Finite in a bounded direction; ``+-inf`` in a direction bounded at one
+        end only (the open end sets the sign); in a direction unbounded at both
+        ends it is the ``center`` this box was constructed with, or ``nan`` if
+        it was built from ``lo``/``hi`` and no centre is defined.
+
+        Computed componentwise on purpose: ``0.5 * (-inf + inf)`` is an invalid
+        operation, so the naive midpoint raises under ``np.seterr(all="raise")``
+        on exactly the unbounded slab that is the idiomatic layer mask.
+        """
+        out = np.empty(3)
+        for d in range(3):
+            lo_d, hi_d = float(self.lo[d]), float(self.hi[d])
+            lo_fin, hi_fin = np.isfinite(lo_d), np.isfinite(hi_d)
+            if lo_fin and hi_fin:
+                out[d] = 0.5 * (lo_d + hi_d)
+            elif lo_fin:
+                out[d] = np.inf
+            elif hi_fin:
+                out[d] = -np.inf
+            elif self._center_given is not None:
+                out[d] = self._center_given[d]
+            else:
+                out[d] = np.nan
+        return out
 
     @property
     def size(self) -> np.ndarray:
@@ -621,8 +680,21 @@ class HalfSpace(Shape):
 
     def _contains(self, x, y, z):
         n, p = self.normal, self.point
-        return (n[0] * (x - p[0]) + n[1] * (y - p[1])
-                + n[2] * (z - p[2])) <= 0.0
+        # Skip the zero components rather than multiplying them in.  For an
+        # axis-aligned plane -- the common case -- a coordinate of +-inf in an
+        # ignored direction would otherwise form 0*inf = nan and report the
+        # point as *outside*, which is both an invalid operation (fatal under
+        # np.seterr(all="raise")) and the wrong answer: an infinite x says
+        # nothing about which side of z = const a point is on.
+        acc = None
+        for ni, ci, pi in zip(n, (x, y, z), p):
+            if ni == 0.0:
+                continue
+            term = ni * (ci - pi)
+            acc = term if acc is None else acc + term
+        if acc is None:  # unreachable: the constructor rejects a zero normal
+            raise ValueError("normal must be non-zero")
+        return acc <= 0.0
 
     def bbox(self) -> BBox:
         # Bounded only when the plane is axis-aligned; that is the common case
@@ -737,6 +809,17 @@ class Prism(Shape):
         coords = (x, y, z)
         iu, iv = _plane_axes(self.axis)
         u, v = coords[iu], coords[iv]
+        # A point at infinity is outside any bounded polygon, but the edge
+        # arithmetic below would form 0*inf and inf-inf on the way to that
+        # answer, which is an invalid operation: a RuntimeWarning normally and
+        # a FloatingPointError under np.seterr(all="raise").  Substitute a
+        # finite placeholder and mask the result instead.  Every other
+        # primitive returns cleanly here, so Prism should too.
+        fu, fv = np.isfinite(u), np.isfinite(v)
+        all_finite = bool(fu.all() and fv.all())
+        if not all_finite:
+            u = np.where(fu, u, 0.0)
+            v = np.where(fv, v, 0.0)
         shape = np.broadcast_shapes(np.shape(u), np.shape(v))
         inside = np.zeros(shape, dtype=bool)
         on_edge = np.zeros(shape, dtype=bool)
@@ -761,6 +844,8 @@ class Prism(Shape):
                         & (dot >= -tol * seg_len)
                         & (dot <= seg_len * seg_len + tol * seg_len))
         inside |= on_edge
+        if not all_finite:
+            inside &= fu & fv
         if np.isinf(self.lo) and np.isinf(self.hi):
             return inside
         w = coords[self.axis]
@@ -953,13 +1038,7 @@ def voxelize(grid: RectilinearGrid, shape: Shape, subsample: int = 2,
         raise ValueError(f"grid must be a RectilinearGrid, got {type(grid).__name__}")
     if not isinstance(shape, Shape):
         raise ValueError(f"shape must be a Shape, got {type(shape).__name__}")
-    if isinstance(subsample, bool) or not isinstance(subsample, (int, np.integer)):
-        raise ValueError(f"subsample must be an integer, got {subsample!r}")
-    s = int(subsample)
-    if s < 1:
-        raise ValueError(f"subsample must be >= 1, got {s}")
-    if not isinstance(chunk_points, (int, np.integer)) or chunk_points < 1:
-        raise ValueError(f"chunk_points must be a positive integer, got {chunk_points!r}")
+    s = _check_sampling_args(subsample, chunk_points)
 
     nx, ny, nz = grid.shape_cells
     out = np.zeros((nx, ny, nz), dtype=np.float64)
@@ -1003,6 +1082,188 @@ def voxelize(grid: RectilinearGrid, shape: Shape, subsample: int = 2,
                     f"expected {xs.size * ys.size * zs.size}")
             blk = np.reshape(inside, (i1 - i0, s, j1 - j0, s, nz, s))
             out[i0:i1, j0:j1, :] = blk.sum(axis=(1, 3, 5), dtype=np.int64) * inv
+    return out
+
+
+def _check_sampling_args(subsample, chunk_points) -> int:
+    """Validate ``subsample``/``chunk_points`` the way :func:`voxelize` does."""
+    if isinstance(subsample, bool) or not isinstance(subsample, (int, np.integer)):
+        raise ValueError(f"subsample must be an integer, got {subsample!r}")
+    s = int(subsample)
+    if s < 1:
+        raise ValueError(f"subsample must be >= 1, got {s}")
+    if not isinstance(chunk_points, (int, np.integer)) or chunk_points < 1:
+        raise ValueError(f"chunk_points must be a positive integer, got {chunk_points!r}")
+    return s
+
+
+def _slab_axis_geometry(nodes: np.ndarray, h: np.ndarray, lo: float, hi: float,
+                        s: int) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Exact per-cell coverage of ``[lo, hi]`` plus sample points inside it.
+
+    Parameters
+    ----------
+    nodes : np.ndarray
+        Node coordinates along the stack axis [m], shape ``(N+1,)``.
+    h : np.ndarray
+        Cell widths along the same axis [m], shape ``(N,)``.
+    lo, hi : float
+        Slab extent [m].
+    s : int
+        Sample points per cell along the axis.
+
+    Returns
+    -------
+    w : np.ndarray
+        Per-cell fraction of the cell width covered by the slab, shape
+        ``(N,)``, **exact** (no quadrature involved).
+    coords : np.ndarray
+        Sample coordinates [m] for the covered cells only, ``s`` per cell,
+        placed at the midpoints of ``s`` equal parts of the cell/slab
+        *intersection*, length ``s * (k1 - k0)``.
+    k0, k1 : int
+        Half-open range of covered cells.  ``k1 <= k0`` means the slab misses
+        the grid entirely.
+    """
+    a = np.maximum(nodes[:-1], lo)
+    b = np.minimum(nodes[1:], hi)
+    length = np.clip(b - a, 0.0, None)
+    w = length / h
+    # A boundary that lands on a node plane to within round-off must give
+    # exactly 0 or 1, or an aligned stack leaves a 1e-16 sliver of the wrong
+    # material in the cell next to every interface.  A2 promises a planar
+    # process costs nothing; a sliver is not nothing when the neighbour is a
+    # conductor and the quantity of interest is a leakage current.
+    w[np.abs(w - 1.0) < 1e-12] = 1.0
+    w[w < 1e-12] = 0.0
+    full = w >= 1.0
+    a = np.where(full, nodes[:-1], a)
+    length = w * h
+    covered = np.flatnonzero(length > 0.0)
+    if covered.size == 0:
+        return w, np.zeros(0), 0, 0
+    # A slab is an interval, so the covered cells are contiguous.
+    k0, k1 = int(covered[0]), int(covered[-1]) + 1
+    f = (np.arange(s, dtype=float) + 0.5) / s
+    coords = (a[k0:k1, None] + f[None, :] * length[k0:k1, None]).ravel()
+    return w, coords, k0, k1
+
+
+def _voxelize_layer(grid: RectilinearGrid, layer: "Layer", subsample: int = 2,
+                    *, chunk_points: int = 4_000_000,
+                    use_bbox: bool = True) -> np.ndarray:
+    """Fill fraction of one :class:`Layer`, exact along the stack axis.
+
+    Parameters
+    ----------
+    grid : RectilinearGrid
+        Target grid.
+    layer : Layer
+        Layer to sample.
+    subsample : int, optional
+        Sample points per cell per direction, used for the in-plane mask only.
+        Default 2.
+    chunk_points : int, keyword-only, optional
+        Peak sample points per ``contains`` call.  Default 4e6.
+    use_bbox : bool, keyword-only, optional
+        Cull chunks against the mask's bounding box.  Default ``True``.
+
+    Returns
+    -------
+    np.ndarray
+        Shape ``grid.shape_cells``, values in ``[0, 1]``.
+
+    Notes
+    -----
+    Tagged **A2**.  ``voxelize(grid, layer.solid(), s)`` would sample the slab
+    with the same midpoint rule used in-plane, and that is what makes a layer
+    thinner than ``h / s`` voxelise to **identically zero** --- every sample
+    point misses it and a 2 nm gate oxide on a 10 nm mesh silently disappears,
+    shorting the capacitor it was supposed to form.  Here the stack-axis
+    coverage ``w`` is instead computed analytically from the interval overlap,
+    which is what A2 promises for a planar process: exact along the growth
+    direction at any ``subsample``, with fractions that partition each cell
+    exactly (they can never sum past 1, so no layer can displace another).
+
+    The mask is then sampled at points that lie *inside* the layer, so the
+    factorisation ``fill = w * mask_fraction`` is a proper quadrature of the
+    true integral even for a mask that varies along the stack axis --- it does
+    not assume the mask is a prism, though it is exact when it is.
+
+    A layer thinner than a cell is still only an effective medium in that cell;
+    exact fill fractions do not make a sub-cell dielectric behave like a
+    dielectric.  :meth:`LayerStack.add` warns about that case.
+    """
+    s = _check_sampling_args(subsample, chunk_points)
+    out = np.zeros(grid.shape_cells, dtype=np.float64)
+
+    ax = layer.axis
+    all_nodes = (grid.xn, grid.yn, grid.zn)
+    all_h = (grid.hx, grid.hy, grid.hz)
+    w, ws, k0, k1 = _slab_axis_geometry(all_nodes[ax], all_h[ax],
+                                        layer.lo, layer.hi, s)
+    if k1 <= k0:
+        return out  # the layer lies outside the domain along the stack axis
+
+    nk = k1 - k0
+    wk = w[k0:k1]
+    wshape = [1, 1, 1]
+    wshape[ax] = nk
+    sl: list[slice] = [slice(None)] * 3
+    sl[ax] = slice(k0, k1)
+
+    if layer.mask is None:
+        out[tuple(sl)] = wk.reshape(wshape)
+        return out
+
+    mask = layer.mask
+    lo_b, hi_b = _bbox_arrays(mask.bbox())
+    if use_bbox and (np.any(hi_b < lo_b)
+                     or ws.max() < lo_b[ax] or ws.min() > hi_b[ax]):
+        return out
+
+    iu, iv = tuple(d for d in (0, 1, 2) if d != ax)
+    nu, nv = grid.shape_cells[iu], grid.shape_cells[iv]
+    un, vn = all_nodes[iu], all_nodes[iv]
+
+    # Same chunking rule as voxelize: split the slower in-plane axis first, the
+    # faster one only if a single slab still exceeds the budget.
+    per_u_slab = s * (nv * s) * (nk * s)
+    nu_per = min(nu, max(1, int(chunk_points // max(per_u_slab, 1))))
+    if per_u_slab > chunk_points:
+        per_uv_slab = s * s * (nk * s)
+        nv_per = min(nv, max(1, int(chunk_points // max(per_uv_slab, 1))))
+    else:
+        nv_per = nv
+
+    frac = (np.arange(s, dtype=float) + 0.5) / s
+    inv = 1.0 / float(s ** 3)
+    coords: list[np.ndarray] = [np.zeros(0)] * 3
+    coords[ax] = ws
+    ncell = [0, 0, 0]
+    ncell[ax] = nk
+    for i0, i1 in _chunks(nu, nu_per):
+        if use_bbox and (un[i1] < lo_b[iu] or un[i0] > hi_b[iu]):
+            continue
+        coords[iu] = _axis_samples(un, all_h[iu], frac, i0, i1)
+        ncell[iu] = i1 - i0
+        sl[iu] = slice(i0, i1)
+        for j0, j1 in _chunks(nv, nv_per):
+            if use_bbox and (vn[j1] < lo_b[iv] or vn[j0] > hi_b[iv]):
+                continue
+            coords[iv] = _axis_samples(vn, all_h[iv], frac, j0, j1)
+            ncell[iv] = j1 - j0
+            sl[iv] = slice(j0, j1)
+            X, Y, Z = np.meshgrid(*coords, indexing="ij", sparse=True)
+            inside = mask.contains(X, Y, Z)
+            expected = coords[0].size * coords[1].size * coords[2].size
+            if inside.size != expected:
+                raise ValueError(
+                    f"{type(mask).__name__}.contains returned {inside.size} "
+                    f"values, expected {expected}")
+            blk = np.reshape(inside, (ncell[0], s, ncell[1], s, ncell[2], s))
+            hits = blk.sum(axis=(1, 3, 5), dtype=np.int64) * inv
+            out[tuple(sl)] = hits * wk.reshape(wshape)
     return out
 
 
@@ -1071,7 +1332,7 @@ class LayerStack:
     --------
     >>> from fieldspice.grid import RectilinearGrid
     >>> g = RectilinearGrid.uniform([(0, 4e-6), (0, 4e-6), (0, 3e-7)],
-    ...                             [8, 8, 6])
+    ...                             [8, 8, 15])   # 20 nm cells resolve the oxide
     >>> st = LayerStack(g, axis="z", origin=0.0)
     >>> _ = st.add("gate", 100e-9, "poly")
     >>> _ = st.add("oxide", 20e-9, "sio2")
@@ -1123,6 +1384,18 @@ class LayerStack:
         ValueError
             On a duplicate name, a non-positive thickness, or a mask that is
             not a :class:`Shape`.
+
+        Warns
+        -----
+        UserWarning
+            If the layer runs past the domain wall, or if it is thinner than
+            the cells it lands in.  The second case is the one that quietly
+            ruins a device: the layer is then representable only as an
+            effective-medium blend, and linear mixing of a 2 nm oxide into a
+            10 nm metal cell gives a conductor, i.e. a shorted capacitor.  No
+            fill-fraction scheme can fix that --- put a node plane on each
+            interface (``grid.auto_mesh_1d`` takes the boundaries as
+            ``features``).
         """
         if not isinstance(name, str) or not name:
             raise ValueError("layer name must be a non-empty string")
@@ -1151,6 +1424,22 @@ class LayerStack:
                 f"{_AXIS_NAMES[self.axis]} but the grid covers "
                 f"[{g_lo:g}, {g_hi:g}] m; it will be clipped by the domain",
                 stacklevel=2)
+
+        nodes = (self.grid.xn, self.grid.yn, self.grid.zn)[self.axis]
+        h = (self.grid.hx, self.grid.hy, self.grid.hz)[self.axis]
+        spanned = ((nodes[1:] > layer.lo + tol) & (nodes[:-1] < layer.hi - tol))
+        if np.any(spanned):
+            h_min = float(h[spanned].min())
+            if t < h_min * (1.0 - 1e-12):
+                warnings.warn(
+                    f"layer {name!r} is {t:g} m thick but the cells it lies in "
+                    f"are {h_min:g} m along {_AXIS_NAMES[self.axis]}, so it "
+                    f"cannot fill a cell and will exist only as an effective-"
+                    f"medium blend (A2): a dielectric thinner than a cell gets "
+                    f"mixed with the conductor around it, which is a short, "
+                    f"not a capacitor. Refine the mesh so that {layer.lo:g} m "
+                    f"and {layer.hi:g} m are node planes",
+                    stacklevel=2)
         return layer
 
     # -- queries -----------------------------------------------------------
@@ -1211,8 +1500,33 @@ class LayerStack:
         return self[name].solid()
 
     def voxelize(self, name: str, subsample: int = 2, **kw) -> np.ndarray:
-        """Fill fraction of one layer on the grid, shape ``grid.shape_cells``."""
-        return voxelize(self.grid, self.solid(name), subsample, **kw)
+        """Fill fraction of one layer on the grid, shape ``grid.shape_cells``.
+
+        Parameters
+        ----------
+        name : str
+            Layer name.
+        subsample : int, optional
+            Sample points per cell per direction, used for the in-plane mask
+            only.  Default 2.
+        **kw
+            ``chunk_points`` and ``use_bbox``, as in :func:`voxelize`.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``grid.shape_cells``, values in ``[0, 1]``.
+
+        Notes
+        -----
+        Coverage along the stack axis is computed **analytically** rather than
+        sampled, so a layer thinner than one sub-sample spacing keeps its true
+        fraction instead of vanishing, and the fractions of a stack partition
+        each cell exactly.  ``voxelize(grid, stack.solid(name), s)`` is the
+        generic sampler and does *not* have that property --- see
+        :func:`_voxelize_layer`.
+        """
+        return _voxelize_layer(self.grid, self[name], subsample, **kw)
 
     # -- diagnostics -------------------------------------------------------
     def check_alignment(self, rtol: float = 1e-9) -> list[str]:
@@ -1269,23 +1583,33 @@ class LayerStack:
               **assign_kw) -> None:
         """Write every layer into a :class:`~fieldspice.materials.MaterialMap`.
 
-        Layers are applied bottom first, so a later layer wins wherever two
-        overlap.  Stacked layers never overlap along the axis, so this only
-        matters when a mask is deliberately reused.
+        Layers are applied bottom first.  Their fill fractions **partition**
+        each cell --- coverage along the stack axis is computed analytically, so
+        the fractions of a stack can never sum past 1 --- and
+        ``MaterialMap.assign`` accumulates them, giving the volume-weighted
+        effective medium of every phase present plus whatever was in the cell
+        before, weighted by the part no layer claimed.  A cell straddling an
+        interface is therefore mixed, not overwritten, and the result does not
+        depend on the order of the calls.
 
         Parameters
         ----------
         matmap : MaterialMap
             Target map.  Must be built on the same grid.
         subsample : int, optional
-            Sampling density passed to :func:`voxelize`.  Default 2.
+            Sampling density for the in-plane masks, passed to
+            :func:`_voxelize_layer`.  It does not affect the stack-axis
+            coverage, which is exact.  Default 2.
         binary : bool, optional
             If ``True``, hand ``MaterialMap.assign`` a boolean mask
-            (``fraction >= threshold``) instead of the fill fraction, discarding
-            the sub-cell information that partially cancels the staircase error
-            of A2.  Default ``False``.
+            (fraction ``>= threshold``, and nonzero) instead of the fill
+            fraction, discarding the sub-cell information that partially
+            cancels the staircase error of A2.  A layer that fills no cell to
+            ``threshold`` then disappears entirely, which is reported as a
+            warning.  Default ``False``.
         threshold : float, optional
-            Cutoff used when ``binary`` is ``True``.  Default 0.5.
+            Cutoff used when ``binary`` is ``True``.  Default 0.5.  A cell with
+            zero fill is never selected, whatever the threshold.
         **assign_kw
             Forwarded verbatim to ``MaterialMap.assign``, which is where the
             effective-medium mixing rule lives (``mix="linear"`` is exact for
@@ -1295,8 +1619,19 @@ class LayerStack:
         Raises
         ------
         ValueError
-            If ``matmap`` exposes a ``grid`` that is not this stack's grid, or
-            if it has no ``assign`` method.
+            If ``matmap`` exposes a ``grid`` that is not this stack's grid, if
+            it has no ``assign`` method, or if ``threshold`` is outside
+            ``[0, 1]``.  Errors from ``assign`` itself (an unknown mixing rule,
+            a material-name collision) propagate unchanged.
+
+        Notes
+        -----
+        Tagged **A2**.  Mixing recovers the *average* material of a straddling
+        cell, not its internal structure: a dielectric thinner than one cell
+        still ends up blended with the metal around it, which is a short, not a
+        capacitor.  :meth:`add` warns when a layer is that thin, and
+        :meth:`check_alignment` reports every interface that misses a node
+        plane; both are worth running before a real extraction.
         """
         assign = getattr(matmap, "assign", None)
         if not callable(assign):
@@ -1304,25 +1639,24 @@ class LayerStack:
         mm_grid = getattr(matmap, "grid", None)
         if mm_grid is not None and mm_grid is not self.grid:
             raise ValueError("matmap was built on a different grid than this LayerStack")
-        if not 0.0 <= float(threshold) <= 1.0:
+        thr = float(threshold)
+        if not 0.0 <= thr <= 1.0:
             raise ValueError(f"threshold must lie in [0, 1], got {threshold}")
 
         for layer in self._layers:
-            frac = voxelize(self.grid, layer.solid(), subsample)
+            frac = _voxelize_layer(self.grid, layer, subsample)
             if binary:
-                assign(frac >= float(threshold), layer.material, **assign_kw)
+                # `frac > 0` is not redundant: at threshold 0 the bare
+                # `frac >= threshold` selects every cell in the domain and
+                # paints the layer over the whole grid.
+                sel = (frac >= thr) & (frac > 0.0)
+                if not sel.any() and frac.any():
+                    warnings.warn(
+                        f"layer {layer.name!r} fills no cell to the binary "
+                        f"threshold {thr:g} (its largest fill fraction is "
+                        f"{frac.max():.3g}) and has been dropped; refine the "
+                        f"mesh, lower the threshold, or use binary=False",
+                        stacklevel=2)
+                assign(sel, layer.material, **assign_kw)
                 continue
-            try:
-                assign(frac, layer.material, **assign_kw)
-            except (TypeError, IndexError, ValueError) as exc:
-                # MaterialMap is written independently; if this build of it only
-                # accepts boolean masks, fall back rather than fail, but say so,
-                # because the fallback throws away the sub-cell mixing that
-                # makes fill fractions worth computing at all.
-                warnings.warn(
-                    f"MaterialMap.assign rejected a fill-fraction array "
-                    f"({exc}); falling back to a boolean mask at threshold "
-                    f"{threshold:g}, which forfeits sub-cell material mixing. "
-                    f"Pass binary=True to silence this.",
-                    stacklevel=2)
-                assign(frac >= float(threshold), layer.material, **assign_kw)
+            assign(frac, layer.material, **assign_kw)
