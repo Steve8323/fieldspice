@@ -154,10 +154,17 @@ speed difference, and a guarantee of a unique solution.
 
 **Escape hatches.** The `ac` solver accepts complex permittivity
 `eps' - j eps''` per frequency, which covers dielectric loss and Debye/
-Cole–Cole relaxation exactly. The `fdtd` solver supports Drude and Lorentz
-poles via auxiliary differential equations. Anisotropic (tensor) materials and
-ferroelectrics are **not** supported; a diagonal-tensor extension is
-straightforward within this formulation, off-diagonal is not.
+Cole–Cole relaxation exactly, and `PhysicsOptions` exposes temperature
+dependence of `sigma` and `kappa` (A6).
+
+**Not supported, stated plainly:** anisotropic (tensor) materials,
+ferroelectrics and any polarization state variable, and **time-domain
+dispersion of any kind**. The `fdtd` solver has no Drude or Lorentz poles —
+an earlier revision of this document claimed otherwise and was wrong; there is
+no auxiliary-differential-equation machinery in `solvers/fdtd.py`. A
+diagonal-tensor extension is straightforward within this formulation;
+off-diagonal coupling and dispersion are not, because both break the
+diagonality of the mass matrices that the whole scheme rests on.
 
 ---
 
