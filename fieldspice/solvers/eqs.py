@@ -100,6 +100,7 @@ class EQSSolver(TimeSteppingSolver):
         self.L_eps = nodal_laplacian(grid, self.eps_edge, G=G)      # [F]
         self.L_sigma = nodal_laplacian(grid, self.sigma_edge, G=G)  # [S]
         self._cache: dict[tuple[float, float], LinearSystem] = {}
+        self._node_vol: np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # Boundary / terminal bookkeeping
@@ -127,16 +128,38 @@ class EQSSolver(TimeSteppingSolver):
         uniq, last = np.unique(fixed[::-1], return_index=True)
         return uniq, values[::-1][last]
 
+    def _node_weights(self, nodes: np.ndarray) -> np.ndarray:
+        """Dual-volume weights for spreading a terminal quantity over nodes.
+
+        Injecting a terminal current **equally per node** is wrong and does not
+        converge away: nodes on the edge of a planar electrode own half the
+        dual area of an interior node, and a corner node a quarter, so equal
+        injection forces four times the correct current density into the
+        corners. Measured on a uniform bar, that inflates the extracted
+        resistance by 0.6-0.8%, and *refining the mesh makes it slightly
+        worse* (6.2e-3 -> 7.8e-3 from 21 to 81 cells) because the distortion
+        stays localised at the electrode while the cells shrink.
+
+        Weighting by the dual volume makes the injected current density uniform
+        and reproduces the analytic resistance to 1e-13 at every refinement.
+        For an electrode lying in a coordinate plane the dual volume is
+        proportional to the dual area (all its nodes share the same normal
+        half-width), which is exactly the weight wanted.
+        """
+        from ..operators import node_volume_vector
+        if self._node_vol is None:
+            self._node_vol = node_volume_vector(self.grid)
+        w = self._node_vol[nodes]
+        total = float(w.sum())
+        return w / total if total > 0 else np.full(nodes.size, 1.0 / nodes.size)
+
     def _inject(self, terminals: Sequence[Terminal], t: float) -> np.ndarray:
         """Current injected into each node by current-driven terminals [A]."""
         rhs = np.zeros(self.grid.n_nodes)
         for term in terminals:
             if term.driven == "current":
                 i_tot = float(term.value_at(t))
-                # Spread the terminal current over its nodes by dual area so
-                # that refining the electrode mesh does not change the answer.
-                w = np.ones(term.nodes.size)
-                rhs[term.nodes] += i_tot * w / w.sum()
+                rhs[term.nodes] += i_tot * self._node_weights(term.nodes)
         return rhs
 
     def _system(self, dt: float, theta: float) -> LinearSystem:
@@ -337,7 +360,10 @@ class EQSSolver(TimeSteppingSolver):
     def _record_terminals(self, res: Result, terminals: Sequence[Terminal],
                           phis: Sequence[np.ndarray], times, dt) -> None:
         for term in terminals:
-            v = np.array([float(np.mean(p[term.nodes])) for p in phis])
+            w = self._node_weights(term.nodes)
+            # Area-weighted, to match the weighting used for injection;
+            # a plain mean over-counts low-area corner nodes.
+            v = np.array([float(np.dot(w, p[term.nodes])) for p in phis])
             if dt is None:
                 i = np.array([float((self.L_sigma @ phis[0])[term.nodes].sum())])
             else:

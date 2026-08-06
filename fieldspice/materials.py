@@ -406,6 +406,64 @@ class Material:
     loss_tangent: float = 0.0
     ref: str = ""
 
+    # -- thermal (assumption A6; only used when self-heating is enabled) ----
+    kappa: float = 1.0
+    """Thermal conductivity [W/(m K)].
+
+    Defaults to 1.0 rather than 0.0 deliberately: a zero-conductivity region
+    makes the heat equation singular there, exactly as a zero-sigma region does
+    for the electrical problem, and a silent singularity is worse than a
+    slightly wrong default. Set it explicitly for anything thermal.
+    """
+
+    rho_mass: float = 1000.0
+    """Mass density [kg/m^3]. Only enters transient thermal problems."""
+
+    c_p: float = 1000.0
+    """Specific heat capacity [J/(kg K)]. Only enters transient problems."""
+
+    tcr: float = 0.0
+    """Temperature coefficient of resistivity [1/K] at :data:`T_ROOM`.
+
+    Conductivity is modelled as ``sigma(T) = sigma / (1 + tcr*(T - T_ref))``,
+    the standard linear-resistivity form. Positive for metals (copper 3.93e-3),
+    which is what makes a metal's resistance rise as it heats --- and what makes
+    thermal runaway possible in a current-driven conductor. Zero means the
+    material is treated as temperature-independent, which is the default so
+    that existing isothermal results are unchanged.
+    """
+
+    kappa_exponent: float = 0.0
+    """Exponent in ``kappa(T) = kappa * (T_ref/T)**kappa_exponent``.
+
+    Crystalline silicon is strongly temperature dependent (exponent ~1.3 near
+    300 K, so its conductivity nearly halves by 500 K); metals and amorphous
+    films are much flatter. Zero disables the dependence.
+    """
+
+    def kappa_at(self, T: float | np.ndarray = T_ROOM) -> float | np.ndarray:
+        """Thermal conductivity at temperature ``T`` [W/(m K)]."""
+        if self.kappa_exponent == 0.0:
+            return self.kappa
+        T = np.maximum(np.asarray(T, dtype=float), 1.0)
+        return self.kappa * (T_ROOM / T) ** self.kappa_exponent
+
+    def sigma_at(self, T: float | np.ndarray = T_ROOM) -> float | np.ndarray:
+        """Electrical conductivity at temperature ``T`` [S/m].
+
+        Linear-resistivity model. Clamped below at 1e-6 of the nominal value so
+        that a runaway search cannot drive the conductance negative and produce
+        a nonsensical (and silently unstable) system.
+        """
+        if self.tcr == 0.0:
+            return self.sigma
+        denom = 1.0 + self.tcr * (np.asarray(T, dtype=float) - T_ROOM)
+        return self.sigma / np.maximum(denom, 1e-6)
+
+    def volumetric_heat_capacity(self) -> float:
+        """``rho * c_p`` [J/(m^3 K)] --- what the transient solver actually uses."""
+        return self.rho_mass * self.c_p
+
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("Material.name must be a non-empty string")
@@ -758,6 +816,75 @@ LIBRARY: dict[str, Material] = {
                   "a Drude metal above its ~1.5 um plasma wavelength, which "
                   "the real-scalar model (A3) cannot represent."),
 }
+
+# ==========================================================================
+# Thermal properties (assumption A6)
+# ==========================================================================
+# Applied after construction rather than inline so the electrical and thermal
+# provenance stay separately auditable, and so that a material with no entry
+# here keeps the conservative Material defaults instead of silently inheriting
+# a neighbour's numbers.
+#
+# Columns: kappa [W/(m K)], rho [kg/m^3], c_p [J/(kg K)], tcr [1/K],
+#          kappa_exponent [-]
+#
+# Bulk handbook values at 300 K (CRC Handbook 97th ed.; Sze & Ng App. G).
+# THIN FILMS ARE ROUTINELY 2-10x WORSE than these bulk numbers: phonon
+# boundary scattering at film interfaces and grain boundaries dominates below
+# ~1 um. Polysilicon and sputtered AlN are the worst offenders and are flagged
+# individually. Treat every kappa here as an optimistic bound for a thin film.
+_THERMAL: dict[str, tuple[float, float, float, float, float]] = {
+    # name        kappa    rho     c_p    tcr        kappa_exp
+    "vacuum":    (1e-6,    1e-6,   1.0,   0.0,       0.0),
+    "air":       (0.0262,  1.204,  1005., 0.0,       0.0),
+    "si":        (148.0,   2329.,  700.,  0.0,       1.30),
+    "sio2":      (1.4,     2200.,  730.,  0.0,       0.0),
+    "si3n4":     (30.0,    3170.,  700.,  0.0,       0.0),
+    "hfo2":      (1.1,     9680.,  290.,  0.0,       0.0),
+    "alumina":   (30.0,    3950.,  880.,  0.0,       0.0),
+    "aln":       (285.0,   3260.,  740.,  0.0,       1.20),
+    "scaln":     (60.0,    3400.,  700.,  0.0,       0.0),
+    "fr4":       (0.30,    1850.,  1200., 0.0,       0.0),
+    "cu":        (401.0,   8960.,  385.,  3.93e-3,   0.0),
+    "al":        (237.0,   2700.,  897.,  4.29e-3,   0.0),
+    "w":         (173.0,   19250., 134.,  4.50e-3,   0.0),
+    "mo":        (138.0,   10280., 251.,  4.35e-3,   0.0),
+    "ti":        (21.9,    4507.,  522.,  3.80e-3,   0.0),
+    "pt":        (71.6,    21450., 133.,  3.93e-3,   0.0),
+    "poly":      (30.0,    2320.,  700.,  0.0,       0.0),
+    "ito":       (8.7,     7120.,  340.,  0.0,       0.0),
+    "igzo":      (1.4,     6100.,  500.,  0.0,       0.0),
+    "a_si":      (1.8,     2285.,  700.,  0.0,       0.0),
+    "gaas":      (55.0,    5320.,  330.,  0.0,       1.25),
+    "sic":       (370.0,   3210.,  690.,  0.0,       1.30),
+}
+
+_THERMAL_NOTES: dict[str, str] = {
+    "poly": ("Polysilicon kappa is grain-size limited and spans 15-60 W/(m K) "
+             "in the literature; 30 is a mid-range placeholder, not a "
+             "measurement."),
+    "aln": ("285 is BULK SINGLE CRYSTAL. Sputtered c-AlN thin films measure "
+            "20-100 W/(m K) depending on grain quality and thickness, so this "
+            "value is optimistic by up to 10x for a deposited film."),
+    "scaln": "Sc-alloying suppresses kappa further; 60 is an estimate.",
+    "igzo": ("Amorphous oxide semiconductor; kappa ~1-2 W/(m K) is reported "
+             "but scatters widely with composition and anneal."),
+    "ito": "Polycrystalline film value; strongly deposition dependent.",
+    "vacuum": ("kappa is a numerical floor, not physics: true vacuum conducts "
+               "no heat, but a zero makes the heat equation singular. Do not "
+               "read a vacuum temperature as meaningful."),
+}
+
+for _nm, (_k, _rho, _cp, _tcr, _kexp) in _THERMAL.items():
+    if _nm in LIBRARY:
+        _extra = _THERMAL_NOTES.get(_nm, "")
+        _m = LIBRARY[_nm]
+        LIBRARY[_nm] = replace(
+            _m, kappa=_k, rho_mass=_rho, c_p=_cp, tcr=_tcr,
+            kappa_exponent=_kexp,
+            ref=(_m.ref + (("  THERMAL: " + _extra) if _extra else "")))
+del _nm, _k, _rho, _cp, _tcr, _kexp
+
 
 # Human spellings and common variants, all mapped onto the canonical keys.
 _ALIASES: dict[str, str] = {

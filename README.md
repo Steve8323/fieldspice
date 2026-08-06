@@ -140,6 +140,8 @@ three agree with Yee's original scheme.
 | `circuit.mna` | modified nodal analysis | lumped netlists, SPICE subset | shipped |
 | `circuit.coupling` | Schur complement | **field + netlist as one system** | shipped |
 | `extraction` | — | C, R, RLGC, Z₀, S-parameters | shipped |
+| `thermal` | `ρc ∂ₜT = ∇·(κ∇T) + q` | heat conduction, thermal R and C | shipped |
+| `electrothermal` | the two above, coupled | self-heating, **thermal runaway** | shipped |
 | `mqs` | `∇×(ν∇×A) + σ(∂ₜA + ∇φ) = J` | inductance, eddy currents, skin effect | **not implemented** |
 | `darwin` | both, minus transverse displacement current | full R+L+C | **not implemented** |
 

@@ -206,18 +206,47 @@ project's users are likely to fabricate (IGZO TFTs, thin-film transistors,
 
 ---
 
-## A6 — Isothermal operation
+## A6 — Isothermal operation (DEFAULT ONLY — this one is switchable)
 
-Lattice temperature is uniform and constant (default 300 K). No self-heating.
+By default the lattice temperature is uniform and constant (300 K) and there
+is no self-heating.
 
-**Buys.** Removes a fourth coupled PDE (heat) and its strong nonlinear
-feedback through mobility and `ni`, roughly halving cost and greatly improving
-Newton convergence.
+**Buys.** Removes a fourth coupled PDE and its strong nonlinear feedback
+through conductivity, mobility and `ni`, roughly halving cost and greatly
+improving Newton convergence.
 
-**When it breaks.** Power devices, high-current analog, and anything where
-`I*V / thermal_conductance` exceeds a few kelvin. An optional lattice heat
-equation is provided but is *not* on by default and is not validated to the
-same standard as the electrical solvers.
+**Turning it off.** Set `PhysicsOptions(self_heating=True)` and use
+`fieldspice.solvers.electrothermal.ElectroThermalSolver`. A6 is then removed
+from `Result.meta["assumptions"]` automatically, so a result always states
+whether it was isothermal.
+
+```python
+from fieldspice.physics import PhysicsOptions
+from fieldspice.solvers.electrothermal import ElectroThermalSolver
+opts = PhysicsOptions(self_heating=True)          # relaxes A6
+```
+
+**Why it matters more than it looks.** The isothermal answer is not merely
+less accurate — for a current-driven conductor with a positive temperature
+coefficient it can be *qualitatively* wrong. The self-consistent temperature
+rise is
+
+    dT = A / (1 - A * tcr),   A = R_th * I^2 * R0
+
+which has **no solution at all** above `I_crit = 1/sqrt(R_th R0 tcr)`. An
+isothermal solver reports that device as a perfectly stable operating point;
+the coupled solver raises `ThermalRunaway`. That is exactly the class of error
+mesh refinement cannot fix, because it is a missing mechanism, not a
+truncation error.
+
+Voltage drive is the opposite: `P = V^2/R` falls as `R` rises, so it is
+negative feedback and unconditionally stable. Both branches are validated
+against their closed-form fixed points to ~1e-6 relative.
+
+**Still not modelled with self-heating on.** Radiation, convection inside the
+domain (the boundary Robin condition is a lumped surrogate), temperature
+dependence of `eps`, phonon-ballistic conduction below ~100 nm (where Fourier
+over-predicts conduction), and thermo-mechanical stress.
 
 ---
 

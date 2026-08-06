@@ -230,6 +230,33 @@ class LinearSystem:
     True
     """
 
+    def _direct_budget(self) -> int:
+        """Largest unknown count worth factorising directly, by dimensionality.
+
+        Sparse LU fill-in depends brutally on how connected the graph is, and a
+        single global threshold gets this badly wrong. Measured on this package
+        (scipy SuperLU, COLAMD ordering, M4):
+
+            3D 7-point,  15,625 unknowns  ->  9.8 s to factorise
+            3D 7-point,  29,791 unknowns  -> 27.0 s
+            3D 7-point,  68,921 unknowns  -> did not finish in minutes
+
+        scipy's own ``spsolve`` is just as slow on the same matrix, so this is
+        inherent 3D fill-in under a fill-reducing-but-not-nested-dissection
+        ordering, not a defect here. A flat 2e5 budget therefore sends 3D
+        problems down a path that appears to hang.
+
+        The stencil width is a reliable proxy for dimensionality: roughly 3
+        non-zeros per row in 1D, 5 in 2D, 7 in 3D.
+        """
+        n = max(self.n_free, 1)
+        per_row = self.A.nnz / max(self.A.shape[0], 1)
+        if per_row <= 3.5:          # 1D chain: LU is banded and essentially free
+            return 20 * DIRECT_MAX_UNKNOWNS
+        if per_row <= 5.5:          # 2D: fill-in is O(N log N), still comfortable
+            return DIRECT_MAX_UNKNOWNS
+        return DIRECT_MAX_UNKNOWNS // 10   # 3D: O(N^2) work, O(N^4/3) memory
+
     def __init__(self, A: sp.spmatrix,
                  config: SolverConfig | None = None,
                  *,
@@ -353,7 +380,7 @@ class LinearSystem:
         self.A = A
         self.n_free = nf
 
-        # -- method selection ---------------------------------------------
+
         n_eff = self.n_free
         want = self.cfg.linear_solver
         if want not in ("auto", "direct", "cg", "amg"):
@@ -362,7 +389,7 @@ class LinearSystem:
                 "'auto', 'direct', 'cg', 'amg'")
         notes: list[str] = []
         if want == "auto":
-            if n_eff <= DIRECT_MAX_UNKNOWNS:
+            if n_eff <= self._direct_budget():
                 want = "direct"
             elif _pyamg() is not None:
                 want = "amg"
