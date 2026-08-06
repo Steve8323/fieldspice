@@ -91,6 +91,32 @@ def test_graded_and_auto_mesh():
     assert np.diff(m).max() <= 8e-9 * 1.001       # respected the cap
 
 
+def test_auto_mesh_honours_the_requested_growth_ratio():
+    """The mesh generator must deliver the grading it was asked for.
+
+    A ramp joined to a uniform fill can hand over with a 5x jump if the fill
+    width is chosen only from dx_max, which silently degrades the box method to
+    first order exactly where the geometry is interesting (A10).
+    """
+    cases = [
+        ((0, 2.7e-6), (4e-7,), 4e-8, 2.5e-7),
+        ((0, 5.5e-6), (2e-6, 2.5e-6, 3e-6, 3.5e-6), 4e-8, 2.5e-7),
+        ((0, 8e-7), (4e-7,), 1e-9, 8e-9),
+        ((0, 1e-3), (5e-4,), 1e-6, 5e-5),
+        ((0, 1.0), (0.1, 0.9), 1e-3, 0.05),
+    ]
+    for growth in (1.2, 1.35, 1.5, 1.8):
+        for ext, feats, dmin, dmax in cases:
+            m = auto_mesh_1d(ext, feats, dx_min=dmin, dx_max=dmax, growth=growth)
+            h = np.diff(m)
+            worst = float(np.max(np.maximum(h[1:] / h[:-1], h[:-1] / h[1:])))
+            assert worst <= growth * 1.10 + 1e-9, (growth, ext, worst)
+            assert m[0] == pytest.approx(ext[0])
+            assert m[-1] == pytest.approx(ext[1])
+            for f in feats:
+                assert np.any(np.isclose(m, f)), f
+
+
 def test_grid_rejects_bad_input():
     with pytest.raises(ValueError):
         RectilinearGrid([1.0, 0.0])               # decreasing

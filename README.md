@@ -130,17 +130,25 @@ three agree with Yee's original scheme.
 
 ## Solvers
 
-| Solver | Equation | Captures | Misses |
+| Solver | Equation | Captures | Status |
 |---|---|---|---|
-| `poisson` | `∇·(ε∇φ) = -ρ` | electrostatics, capacitance | everything dynamic |
-| `eqs` | `∇·[(σ + ε∂ₜ)∇φ] = 0` | R, C, RC delay, crosstalk, IR drop, substrate coupling | inductance, radiation |
-| `mqs` | `∇×(ν∇×A) + σ(∂ₜA + ∇φ) = J` | inductance, eddy currents, skin & proximity effect | displacement current |
-| `darwin` | both, minus the transverse displacement current | full R+L+C | radiation |
-| `ac` | `∂ₜ → jω` | all of the above, per frequency | — |
-| `dd` | van Roosbroeck + Scharfetter–Gummel | semiconductor device physics | ballistic, quantum |
-| `fdtd` | explicit Yee leapfrog | everything, including radiation | nothing (but Courant-limited) |
-| `circuit.mna` | modified nodal analysis | lumped netlists | fields |
-| `circuit.coupling` | Schur complement | **field + netlist as one system** | — |
+| `poisson` | `∇·(ε∇φ) = -ρ` | electrostatics, capacitance; nonlinear Poisson for semiconductor equilibrium | shipped |
+| `eqs` | `∇·[(σ + ε∂ₜ)∇φ] = 0` | R, C, RC delay, crosstalk, IR drop, substrate coupling | shipped |
+| `ac` | `∂ₜ → jω` | harmonic response, Y/Z/S parameters | shipped |
+| `dd` | van Roosbroeck + Scharfetter–Gummel | semiconductor device physics | shipped (one open defect) |
+| `fdtd` | explicit Yee leapfrog | full-wave reference, radiation | shipped (PML broken) |
+| `circuit.mna` | modified nodal analysis | lumped netlists, SPICE subset | shipped |
+| `circuit.coupling` | Schur complement | **field + netlist as one system** | shipped |
+| `extraction` | — | C, R, RLGC, Z₀, S-parameters | shipped |
+| `mqs` | `∇×(ν∇×A) + σ(∂ₜA + ∇φ) = J` | inductance, eddy currents, skin effect | **not implemented** |
+| `darwin` | both, minus transverse displacement current | full R+L+C | **not implemented** |
+
+> **Inductance is not yet modelled.** `mqs` and `darwin` are specified in
+> [`docs/CONTRACTS.md`](docs/CONTRACTS.md) but not built. The quasi-static path
+> today is resistive–capacitive only. `extraction.rlgc_2d` *does* return an
+> inductance matrix, but it gets it from the LC identity (`L = μ₀ε₀ C_air⁻¹`),
+> which is exact for a TEM line and says nothing about eddy currents or skin
+> effect. If your problem is inductive, this release will not serve it.
 
 Pick with `fieldspice.reference.electrical_length(size, t_rise=...)`:
 below 0.01 quasi-static is excellent, above 0.3 you need `fdtd`.

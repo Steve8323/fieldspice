@@ -174,7 +174,34 @@ def _grade_segment(left: float, right: float, dl: float, dr: float,
     if mid < 0:  # ramps overlap; fall back to a simple two-sided grading
         n = max(2, int(np.ceil(span / max(dl, dr, span / 200))))
         return np.linspace(left, right, n + 1)
-    n_mid = max(1, int(np.ceil(mid / dx_max)))
+
+    # The uniform middle must not jump away from the last ramp cell by more
+    # than `growth`, or the mesh has a growth ratio far above the requested one
+    # exactly where the ramps hand over. Choosing n_mid from BOTH the dx_max cap
+    # and the neighbouring cell width is what keeps the honoured ratio equal to
+    # the requested one; without this the union of a ramp and a uniform fill can
+    # easily reach 5x and silently degrade the box method to first order (A10).
+    n_from_cap = int(np.ceil(mid / dx_max)) if mid > 0 else 1
+    neighbours = [c for c in (lr[-1] if lr else None,
+                              rr[-1] if rr else None) if c]
+    if neighbours and mid > 0:
+        widest = growth * max(neighbours)
+        n_from_growth = int(np.ceil(mid / widest))
+    else:
+        n_from_growth = 1
+    n_mid = max(1, n_from_cap, n_from_growth)
+
+    # The mid section can also violate the ratio from *below*: when the two
+    # ramps nearly meet, the leftover sliver is much narrower than the ramp
+    # cells beside it, which is just as bad a jump. There is no point inserting
+    # a sliver at all -- stretch the ramps to fill the segment instead.
+    if neighbours and mid > 0:
+        narrowest = min(neighbours) / growth
+        if mid / n_mid < narrowest:
+            scale = span / used if used > 0 else 1.0
+            widths = [c * scale for c in lr] + [c * scale for c in rr[::-1]]
+            return np.concatenate([[left], left + np.cumsum(widths)])
+
     widths = lr + [mid / n_mid] * n_mid + rr[::-1]
     return np.concatenate([[left], left + np.cumsum(widths)])
 
