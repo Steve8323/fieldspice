@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose a mechanism, solver, or capability
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before opening: `docs/KNOWN_ISSUES.md` lists what is deliberately
+        missing, and `docs/ASSUMPTIONS.md` lists what is deliberately assumed.
+        Several obvious gaps (inductance, noise, dispersion, anisotropy) are
+        already recorded there.
+  - type: textarea
+    id: what
+    attributes:
+      label: What should it do
+    validations: { required: true }
+  - type: textarea
+    id: physics
+    attributes:
+      label: What physics does it add, and which assumption does it relax?
+      description: >
+        Every optional mechanism in fieldspice is tied to an assumption tag
+        (A1..A14) that it removes from `Result.meta`. Which one is this?
+    validations: { required: false }
+  - type: textarea
+    id: reference
+    attributes:
+      label: What closed-form reference would validate it?
+      description: >
+        The bar for a new mechanism is an analytic or independently-computed
+        case it must reproduce, with a number.
+    validations: { required: false }

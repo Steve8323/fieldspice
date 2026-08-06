@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+title: >-
+  fieldspice: first-principles electromagnetic field simulation
+  for analog and digital circuits
+message: If you use this software, please cite it as below.
+type: software
+authors:
+  - family-names: Hou
+    given-names: Steven
+repository-code: https://github.com/Steve8323/fieldspice
+license: MIT
+version: 0.1.0
+date-released: '2026-08-05'
+keywords:
+  - electromagnetics
+  - quasistatic
+  - finite integration technique
+  - drift-diffusion
+  - TCAD
+  - parasitic extraction
+  - signal integrity
+  - circuit simulation
+  - electrothermal
+abstract: >-
+  A field solver for the regime full-wave FDTD cannot reach: structures far
+  smaller than a wavelength, filled with conductors and semiconductors, driven
+  for microseconds rather than picoseconds. Discretising Maxwell's equations in
+  integrated variables on a Yee grid makes the discrete gradient, curl and
+  divergence exact signed-incidence matrices, so curl-grad and div-curl vanish
+  identically and all metric information collapses into diagonal mass matrices
+  that are ordinary circuit elements. A field region is therefore literally an
+  RLC network, which makes exact field-circuit coupling a matter of assembly
+  rather than interpolation. Dropping radiation removes the Courant limit and
+  buys four to ten orders of magnitude in step count. Includes
+  electroquasistatic, frequency-domain, drift-diffusion, heat-conduction and
+  coupled electro-thermal solvers, a SPICE engine, parasitic extraction, and a
+  full-wave solver retained specifically so the quasi-static approximation can
+  be checked rather than trusted.

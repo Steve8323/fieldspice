@@ -1,5 +1,11 @@
 # fieldspice
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/)
+[![Tests](https://img.shields.io/badge/tests-173%20passing-brightgreen.svg)](tests/)
+[![Status](https://img.shields.io/badge/status-alpha-orange.svg)](CHANGELOG.md)
+[![Assumptions](https://img.shields.io/badge/assumptions-documented-blueviolet.svg)](docs/ASSUMPTIONS.md)
+
 **Electromagnetic field simulation for analog and digital circuits, from first principles.**
 
 A field solver built the way [MEEP](https://meep.readthedocs.io) is built — a
@@ -270,6 +276,20 @@ are all genuinely optional — the package imports and runs without any of them.
 - [`docs/CONTRACTS.md`](docs/CONTRACTS.md) — interface spec and verified reference numbers
 - [`examples/`](examples/) — runnable end-to-end cases
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). The bar is one rule: **every physical
+claim is measured against a closed-form reference**, and the number goes in the
+assertion. Loosening a tolerance to make a test pass will get a PR rejected.
+
+The most valuable open work, in order: a working absorbing boundary for the
+full-wave solver, the drift-diffusion zero-bias offset, and `mqs`/`darwin`
+(there is currently no inductance anywhere in the package).
+
+## Citing
+
+See [CITATION.cff](CITATION.cff), or use GitHub's "Cite this repository".
+
 ## License
 
-MIT.
+MIT — see [LICENSE](LICENSE).

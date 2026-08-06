@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Assumptions and validity conditions
+    url: https://github.com/Steve8323/fieldspice/blob/main/docs/ASSUMPTIONS.md
+    about: Every approximation, tagged, with what it buys and what it costs.
+  - name: Known issues and deliberate omissions
+    url: https://github.com/Steve8323/fieldspice/blob/main/docs/KNOWN_ISSUES.md
+    about: Open defects with measurements, and what is missing on purpose.

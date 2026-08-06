@@ -1,0 +1,46 @@
+name: Bug report
+description: A solver disagrees with a reference, or something breaks
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please include the **measurement**, not just the symptom.
+        `fieldspice.reference` is the oracle for this project — if a solver
+        disagrees with it, say by how much.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did you get, and what did you expect?
+      placeholder: |
+        Extracted capacitance is 3.9e-16 F; reference.parallel_plate_capacitance
+        gives 3.45e-16 F, a 13% error that does not shrink under refinement.
+    validations: { required: true }
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: A self-contained script, please.
+      render: python
+    validations: { required: true }
+  - type: textarea
+    id: convergence
+    attributes:
+      label: Does it converge?
+      description: >
+        Does the discrepancy shrink when you refine the mesh or the time step?
+        An error that does NOT shrink is a model error, which is a very
+        different bug from one that does.
+    validations: { required: false }
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: "0.1.0, or a commit SHA"
+    validations: { required: true }
+  - type: input
+    id: env
+    attributes:
+      label: Python / NumPy / SciPy versions and OS
+    validations: { required: false }
