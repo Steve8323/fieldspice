@@ -189,12 +189,23 @@ Measured on the frozen core:
 
 | Quantity | Result |
 |---|---|
-| `curl grad`, `div curl` | exactly 0 |
-| Parallel-plate capacitance | 1.5e-14 relative error |
-| Slab resistance | 3.4e-14 relative error |
-| Series dielectric stack | matches series capacitors to 1e-10 |
-| EQS step response | correct capacitive-divider initial condition; O(Δt) convergence confirmed (1.22e-3 → 6.11e-4 → 3.06e-4) |
-| pn junction built-in potential | 6.7e-16 relative, 9–11 Newton iterations |
+| `curl grad`, `div curl` | **exactly 0** (±1 integer entries cancel exactly) |
+| Parallel-plate capacitance | 8.5e-14 relative |
+| Slab resistance | 3.4e-14 relative |
+| Series dielectric stack | matches series capacitors to 1.2e-14 |
+| pn built-in potential | ≤7e-12 across **all 12** doping/nᵢ cases, 7–12 Newton iterations |
+| Bernoulli (Scharfetter–Gummel core) | machine precision over x ∈ [−800, 700] |
+| EQS step response | capacitive-divider initial condition exact; O(Δt) confirmed (1.216e-3 → 6.106e-4 → 3.059e-4 → 1.531e-4), **1 factorization per run** |
+| MNA integration order | measured: backward Euler 2.00, trapezoidal 3.96, Gear-2 4.02 |
+| Series RLC | all three damping regimes; under-damped peak 1.95150 vs 1.95153 |
+| Diode ideality (drift-diffusion) | n = 1.0029 over 3.36 decades |
+| FDTD propagation | at c; first-arrival matches 1/Courant exactly |
+| AC admittance | Y = G + jωC to 2e-14 over 9 decades; reciprocity 1e-23 |
+| RLGC extraction | C, L, Z₀ to 8e-14; **LC identity residual exactly 0** |
+| Field↔circuit Schur complement | divider exact to 1e-12; Y·Δt = C to 2e-14; asymmetry 1e-16 |
+
+143 tests pass; 2 are `xfail` for the open defects in
+[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
 
 Some deliberate honesty about tolerances, because a test demanding more accuracy
 than its reference formula possesses is a broken test:

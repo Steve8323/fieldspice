@@ -82,6 +82,20 @@ Currents (`Result.i(...)`) are recorded correctly.
 
 ---
 
+## 4. `mqs` and `darwin` are not implemented (scope gap, not a bug)
+
+Specified in [`CONTRACTS.md`](CONTRACTS.md), never built --- the agent fleet
+that was writing them hit a session rate limit. Consequence: **the quasi-static
+path models R and C but not L.** There is no eddy-current, skin-effect or
+proximity-effect capability, and no inductive transient.
+
+`extraction.rlgc_2d` does return an inductance matrix, but from the LC identity
+`L = mu0 eps0 C_air^-1`, which is exact for a TEM line and says nothing about
+current redistribution inside a conductor. Do not read it as an eddy-current
+result.
+
+---
+
 ## Reporting
 
 Found something else? Please include the measurement, not just the symptom —
